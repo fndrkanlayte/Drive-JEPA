@@ -52,7 +52,7 @@ class DriveJEPAAgent(AbstractAgent):
 
             from .score_module.compute_navsim_score import get_scores
 
-            metric_cache = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/train_metric_cache"))
+            metric_cache = MetricCacheLoader(Path(os.getenv("NAVSIM_EXP_ROOT") + "/Drive-JEPA-cache/train_metric_cache"))
             self.train_metric_cache_paths = metric_cache.metric_cache_paths
             self.test_metric_cache_paths = metric_cache.metric_cache_paths
 
