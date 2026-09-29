@@ -1,6 +1,8 @@
 #!/bin/bash
 
 export NAVSIM_DEVKIT_ROOT=$(pwd)
+# use navsim_v1 code even if navsim_v2 is pip-installed in the env
+export PYTHONPATH=$NAVSIM_DEVKIT_ROOT:$PYTHONPATH
 
 python navsim/planning/script/run_dataset_caching.py \
   agent=drive_jepa_perception_free_agent \

@@ -5,3 +5,5 @@ export NAVSIM_EXP_ROOT="$MY_HOME/navsim_workspace/exp"
 export OPENSCENE_DATA_ROOT="$MY_HOME/navsim_workspace/dataset"
 # export NAVSIM_DEVKIT_ROOT="$MY_HOME/navsim_workspace/navsim"
 export NAVSIM_DEVKIT_ROOT=$(pwd)
+# use navsim_v1 code even if navsim_v2 is pip-installed in the env
+export PYTHONPATH=$NAVSIM_DEVKIT_ROOT:$PYTHONPATH

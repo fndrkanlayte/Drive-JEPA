@@ -32,7 +32,7 @@ class DriveJEPAFeatureBuilder(AbstractFeatureBuilder):
 
     def get_unique_name(self) -> str:
         """Inherited, see superclass."""
-        return "drive_jepa_feature"
+        return "drive_jepa_resnet_feature" if self._config.use_resnet else "drive_jepa_feature"
 
     def _get_camera_feature(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
         """
@@ -66,8 +66,9 @@ class DriveJEPAFeatureBuilder(AbstractFeatureBuilder):
     def compute_features(self, agent_input: AgentInput) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
 
-        features = _get_bev_feature(agent_input)
-        features.update(self._get_camera_feature(agent_input))
+        features = _get_bev_feature(agent_input, return_images=self._config.use_resnet)
+        if not self._config.use_resnet:
+            features.update(self._get_camera_feature(agent_input))
 
         ego_feature_list=[]
 

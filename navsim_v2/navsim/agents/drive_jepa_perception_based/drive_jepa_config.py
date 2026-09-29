@@ -43,7 +43,12 @@ class DriveJEPAConfig:
     tf_num_head: int = 8
     tf_dropout: float = 0
     num_bev_layers: int=1
-    image_architecture: str = "resnet34"
+    # "vit_large": V-JEPA ViT-L on front camera (2 frames); "resnet34": timm ResNet34 on 4 surround cameras (1 frame)
+    image_architecture: str = "vit_large"
+    # number of pseudo targets sampled from simulator-scored anchors per sample
+    num_pseudo_targets: int = 4
+    # learning rate multiplier of the image backbone
+    backbone_lr_mult: float = 0.1
 
     # loss weights
     trajectory_weight: float = 1
@@ -142,6 +147,14 @@ class DriveJEPAConfig:
     bev_features_channels: int = 64
     bev_down_sample_factor: int = 4
     bev_upsample_factor: int = 2
+
+    @property
+    def use_resnet(self) -> bool:
+        return self.image_architecture.startswith("resnet")
+
+    @property
+    def num_cams(self) -> int:
+        return 4 if self.use_resnet else 1
 
     @property
     def bev_semantic_frame(self) -> Tuple[int, int]:

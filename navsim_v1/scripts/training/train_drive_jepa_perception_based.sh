@@ -1,6 +1,8 @@
 #!/bin/bash
 
 export NAVSIM_DEVKIT_ROOT=$(pwd)
+# use navsim_v1 code even if navsim_v2 is pip-installed in the env
+export PYTHONPATH=$NAVSIM_DEVKIT_ROOT:$PYTHONPATH
 TRAIN_TEST_SPLIT=navtrain
 
 torchrun --standalone --nproc_per_node=gpu $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \

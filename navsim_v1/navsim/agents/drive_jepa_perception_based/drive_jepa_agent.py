@@ -79,7 +79,7 @@ class DriveJEPAAgent(AbstractAgent):
     def get_sensor_config(self) :
         """Inherited, see superclass."""
         return SensorConfig(
-            cam_f0=[2, 3],
+            cam_f0=[3] if self._config.use_resnet else [2, 3],
             cam_l0=[3],
             cam_l1=[],
             cam_l2=[],
@@ -215,8 +215,8 @@ class DriveJEPAAgent(AbstractAgent):
                 if idx_arr.shape[0] == 0:
                     continue
 
-                if idx_arr.shape[0] > 4:
-                    sampled_idx = np.random.choice(idx_arr, size=4, replace=False)
+                if idx_arr.shape[0] > config.num_pseudo_targets:
+                    sampled_idx = np.random.choice(idx_arr, size=config.num_pseudo_targets, replace=False)
                 else:
                     sampled_idx = idx_arr
 
@@ -328,9 +328,8 @@ class DriveJEPAAgent(AbstractAgent):
         return self.pad_loss(targets, pred, self._config)
 
     def get_optimizers(self):
-        # Smaller lr for vjepa encoder
         return torch.optim.Adam([
-            {'params': self._pad_model._backbone.parameters(), 'lr': 0.1 * self._lr},
+            {'params': self._pad_model._backbone.parameters(), 'lr': self._config.backbone_lr_mult * self._lr},
             {'params': [p for n, p in self._pad_model.named_parameters() if 'backbone' not in n], 'lr': self._lr},
         ], lr=self._lr)
 

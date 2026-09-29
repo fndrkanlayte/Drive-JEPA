@@ -14,6 +14,7 @@ from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_comfort_metrics 
     ego_is_two_frame_extended_comfort,
 )
 from .bevformer.simple_image_encoder import ImgEncoder
+from .bevformer.resnet_image_encoder import ResNetImgEncoder
 from .drive_jepa_config import DriveJEPAConfig
 from .score_module.scorer import Scorer
 from .traj_refiner import Traj_refiner
@@ -28,7 +29,7 @@ class DriveJEPAModel(nn.Module):
         self.poses_num = config.num_poses
         self.state_size = 3
 
-        self._backbone = ImgEncoder(config)
+        self._backbone = ResNetImgEncoder(config) if config.use_resnet else ImgEncoder(config)
         self.hist_encoding = nn.Linear(11, config.tf_d_model)
         self.init_feature = nn.Embedding(self.poses_num * config.proposal_num, config.tf_d_model)
 
@@ -47,14 +48,19 @@ class DriveJEPAModel(nn.Module):
         return transforms.Compose([normalize])
 
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        features["lidar2img"] = features["lidar2img"][:, 1:2]
         ego_status: torch.Tensor = features["ego_status"][:, -1]
 
-        cam_f_2 = features["camera_feature_2"]
-        cam_f_1 = features["camera_feature_1"]
-        cam_f_2 = self.transform(cam_f_2)
-        cam_f_1 = self.transform(cam_f_1)
-        camera_feature = torch.cat([cam_f_2[:, None], cam_f_1[:, None]], dim=1)
+        if self._config.use_resnet:
+            # 4 surround cameras (b0, f0, l0, r0), already normalized in the feature builder
+            camera_feature = features["camera_feature"]
+        else:
+            # front camera f0 only, 2 frames
+            features["lidar2img"] = features["lidar2img"][:, 1:2]
+            cam_f_2 = features["camera_feature_2"]
+            cam_f_1 = features["camera_feature_1"]
+            cam_f_2 = self.transform(cam_f_2)
+            cam_f_1 = self.transform(cam_f_1)
+            camera_feature = torch.cat([cam_f_2[:, None], cam_f_1[:, None]], dim=1)
 
         batch_size = ego_status.shape[0]
         image_feature = self._backbone(camera_feature, img_metas=features)  # b,64,64,64

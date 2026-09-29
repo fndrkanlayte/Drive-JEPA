@@ -63,7 +63,7 @@ def LoadMultiViewImageFromFiles(agent_input):
 
 
 
-def _get_bev_feature( agent_input, training: bool=False):
+def _get_bev_feature( agent_input, training: bool=False, return_images: bool=False):
     image_result=LoadMultiViewImageFromFiles(agent_input)
     # if training:
     #     image_result = PhotoMetricDistortionMultiViewImage(image_result)
@@ -78,5 +78,7 @@ def _get_bev_feature( agent_input, training: bool=False):
                 "img_shape": torch.FloatTensor(np.stack(image_result["img_shape"])),#8,3
                 "lidar2img": torch.FloatTensor(np.stack(image_result["lidar2img"]))#8,4,4
                 }
+    if return_images:
+        features["camera_feature"] = camera_feature
 
     return features

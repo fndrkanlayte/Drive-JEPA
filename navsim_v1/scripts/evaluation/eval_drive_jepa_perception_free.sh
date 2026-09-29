@@ -1,6 +1,8 @@
 #!/bin/bash
 
 export NAVSIM_DEVKIT_ROOT=$(pwd)
+# use navsim_v1 code even if navsim_v2 is pip-installed in the env
+export PYTHONPATH=$NAVSIM_DEVKIT_ROOT:$PYTHONPATH
 
 CHECKPOINT="${NAVSIM_EXP_ROOT}/Drive-JEPA-cache/drive_jepa_perception_free_agent_vitl.ckpt"
 # Or you can use the ckpt trained by yourself.
