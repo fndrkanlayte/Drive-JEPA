@@ -406,9 +406,11 @@ def main() -> None:
         nt = load_rows(Path(args.navtest_labels_dir), Path(args.navtest_export_dir),
                        args.dt_enter_thresh)
         risk_dir = out_dir / "navtest_risk"
+        n_nt = len(nt["tokens"])
         for variant, seed_runs in runs.items():
-            per_seed = np.stack([
+            per_seed = np.stack([  # (nseed, S*K, 2) -> (nseed, S, K, 2)
                 predict_navtest(r["model"], variant, nt, mem_rows, args, s)
+                .reshape(n_nt, -1, 2)
                 for s, r in zip(args.seeds, seed_runs)
             ])
             save_npz(
