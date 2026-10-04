@@ -104,11 +104,11 @@ def _metric_cache_map(metric_cache_dir: Path) -> Dict[str, str]:
     other machine, so we glob the real files instead.
     """
     mapping = {}
-    for p in Path(metric_cache_dir).glob(f"*/*/{_METRIC_CACHE_FILE}"):
+    for p in Path(metric_cache_dir).glob(f"*/*/*/{_METRIC_CACHE_FILE}"):
         mapping[p.parent.name] = str(p)
     if not mapping:
         raise FileNotFoundError(
-            f"no */*/{_METRIC_CACHE_FILE} under {metric_cache_dir}"
+            f"no */*/*/{_METRIC_CACHE_FILE} under {metric_cache_dir}"
         )
     return mapping
 
