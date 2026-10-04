@@ -198,6 +198,7 @@ def main() -> None:
 
     records: List[dict] = []  # manifest rows
     n_checked = 0
+    n_skipped = 0
 
     def run_batch(feature_list, meta_list):
         nonlocal n_checked
@@ -302,8 +303,14 @@ def main() -> None:
         for token in tqdm(tokens, desc="export(scenes)"):
             if (out_dir / f"{token}.npz").exists():
                 continue
-            scene = scene_loader.get_scene_from_token(token)
-            agent_input = scene.get_agent_input()
+            try:
+                scene = scene_loader.get_scene_from_token(token)
+                agent_input = scene.get_agent_input()
+            except Exception as e:
+                # partially-missing sensor data for this scene -- skip it
+                n_skipped += 1
+                print(f"[export] WARNING: skipping {token}: {e}")
+                continue
             f: Dict[str, torch.Tensor] = {}
             for b in feature_builders:
                 f.update(b.compute_features(agent_input))
@@ -328,6 +335,8 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(records)
     print(f"[export] wrote {len(records)} records -> {out_dir} (manifest: {manifest})")
+    if n_skipped:
+        print(f"[export] skipped scenes (missing data): {n_skipped}")
 
 
 if __name__ == "__main__":
