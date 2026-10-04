@@ -47,22 +47,30 @@ def retrieval_features(
         r = rng if rng is not None else np.random.default_rng(0)
         labels = labels[r.permutation(len(labels))]
 
+    # encode logs as ints once -- string compare in the hot loop dominates
+    log_ids = {lg: i for i, lg in
+               enumerate(np.unique(np.concatenate([q_log, mem_log])))}
+    q_lid = np.array([log_ids[l] for l in q_log])
+    mem_lid = np.array([log_ids[l] for l in mem_log])
+
     D = ml.shape[1]
     n = len(ql)
     out = np.zeros((n, 4 + D), dtype=np.float32)
     # fetch a wider candidate set, then enforce the per-scene cap
     fetch = min(len(ml), max(topk * max_per_scene, topk + 8))
     for i0 in range(0, n, chunk):
-        sims = ql[i0:i0 + chunk] @ ml.T  # (c, M)
-        for bi in range(sims.shape[0]):
+        s = ql[i0:i0 + chunk] @ ml.T  # (c, M) cosine sims
+        # mask same-log neighbours (vectorized on int ids)
+        s = np.where(mem_lid[None, :] == q_lid[i0:i0 + chunk, None], -np.inf, s)
+        idx = np.argpartition(-s, fetch - 1, axis=1)[:, :fetch]
+        order = np.argsort(-np.take_along_axis(s, idx, 1), axis=1)
+        idx = np.take_along_axis(idx, order, axis=1)  # (c, fetch) sim-desc
+        for bi in range(idx.shape[0]):
             i = i0 + bi
-            s = sims[bi]
-            s = np.where(mem_log == q_log[i], -np.inf, s)
-            idx = np.argpartition(-s, fetch - 1)[:fetch]
-            idx = idx[np.argsort(-s[idx])]
+            si = s[bi, idx[bi]]
             picked, counts = [], {}
-            for j in idx:
-                if not np.isfinite(s[j]):
+            for jj, j in enumerate(idx[bi]):
+                if not np.isfinite(si[jj]):
                     break
                 sc = mem_scene[j]
                 if counts.get(sc, 0) >= max_per_scene:
@@ -74,7 +82,7 @@ def retrieval_features(
             if not picked:
                 continue
             picked = np.asarray(picked)
-            w = np.exp(s[picked] - s[picked].max())
+            w = np.exp(s[bi, picked] - s[bi, picked].max())
             w /= w.sum()
             lab = labels[picked]  # (k, 2)
             mean = (w[:, None] * lab).sum(0)
