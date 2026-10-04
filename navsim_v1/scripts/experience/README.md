@@ -32,6 +32,25 @@ Expected artifacts on disk:
 Disk usage per scene: export ≈ 0.07 MB (or ≈ 0.2 MB with `--save_tokens`),
 labels ≈ 0.02 MB. 3000 scenes ≈ 0.3–0.7 GB.
 
+## Minimal first run (smoke test before the full export)
+
+```bash
+# 1. export 20 scenes with the consistency check
+python scripts/experience/export_candidates.py \
+    --checkpoint $CKPT \
+    --feature_cache_dir $NAVSIM_EXP_ROOT/train_drive_jepa_perception_based_cache \
+    --out_dir $NAVSIM_EXP_ROOT/experience/navtrain_export_smoke \
+    --batch_size 8 --max_scenes 20 --check_consistency 20
+# 2. label those 20 scenes
+python scripts/experience/label_candidates.py \
+    --export_dir .../navtrain_export_smoke \
+    --metric_cache_dir $NAVSIM_EXP_ROOT/Drive-JEPA-cache/train_metric_cache \
+    --cache_type train --out_dir .../navtrain_labels_smoke --workers 8
+# 3. audit — sanity fraction should be high
+python scripts/experience/audit_labels.py --labels_dir .../navtrain_labels_smoke
+# then run the full pipeline below
+```
+
 ## Commands
 
 ```bash
@@ -67,10 +86,14 @@ python scripts/experience/audit_labels.py --labels_dir .../navtrain_labels
 # A4 headroom
 python scripts/experience/headroom.py --labels_dir .../navtrain_labels --name navtrain
 
-# A5 oracle kNN check
+# A5 oracle kNN check — run once per feature set (timing is the
+# leakage-safe default; 'full' additionally uses min_dist/overlap)
 python scripts/experience/oracle_knn_check.py \
     --labels_dir .../navtrain_labels --export_dir .../navtrain_export \
-    --out_dir $NAVSIM_EXP_ROOT/experience/oracle
+    --out_dir $NAVSIM_EXP_ROOT/experience/oracle_timing --feature_set timing
+python scripts/experience/oracle_knn_check.py \
+    --labels_dir .../navtrain_labels --export_dir .../navtrain_export \
+    --out_dir $NAVSIM_EXP_ROOT/experience/oracle_full --feature_set full
 ```
 
 ## Runtime knobs

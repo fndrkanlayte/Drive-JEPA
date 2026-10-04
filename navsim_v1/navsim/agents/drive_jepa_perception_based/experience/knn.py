@@ -32,8 +32,13 @@ def knn_predict(
     pool_block: Optional[np.ndarray] = None,
     query_block: Optional[np.ndarray] = None,
     rng: Optional[np.random.Generator] = None,
+    chunk_size: int = 1024,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """kNN regression: predict mean/var of neighbour labels per query row.
+
+    Vectorized in chunks of `chunk_size` queries: each chunk forms a
+    (chunk, N) distance matrix, same-block pool rows are masked with +inf,
+    and per-row neighbour sets are extracted with argpartition + argsort.
 
     :param pool_x: (N, D) standardized pool features.
     :param pool_y: (N,) pool labels.
@@ -42,32 +47,58 @@ def knn_predict(
     :param pool_block/query_block: optional group ids (e.g. log_name); pool rows
         sharing the query's group are excluded as neighbours (leakage guard).
     :param rng: if given, neighbours are sampled uniformly at random instead of
-        by distance ("random memory" control).
+        by distance ("random memory" control; kept per-row since it is cheap).
     :return: (mean_labels (M,), var_labels (M,))
     """
     pool_x = np.asarray(pool_x, dtype=np.float64)
     query_x = np.asarray(query_x, dtype=np.float64)
     pool_y = np.asarray(pool_y, dtype=np.float64)
-    m = query_x.shape[0]
+    m, n = query_x.shape[0], pool_x.shape[0]
     means = np.full(m, np.nan, dtype=np.float64)
     variances = np.full(m, np.nan, dtype=np.float64)
 
-    for i in range(m):
-        valid = np.ones(pool_x.shape[0], dtype=bool)
+    if rng is not None:  # random-memory control: per-row sampling
+        for i in range(m):
+            valid = np.ones(n, dtype=bool)
+            if pool_block is not None and query_block is not None:
+                valid &= pool_block != query_block[i]
+            idx = np.flatnonzero(valid)
+            if len(idx) == 0:
+                continue
+            sel = rng.choice(idx, size=min(k, len(idx)), replace=False)
+            labels = pool_y[sel]
+            means[i] = labels.mean()
+            variances[i] = labels.var()
+        return means, variances
+
+    pool_sq = (pool_x**2).sum(axis=1)  # (N,)
+    k_take = min(k, n)
+    for s in range(0, m, chunk_size):
+        q = query_x[s : s + chunk_size]
+        # squared L2 via dot products: no (c, N, D) intermediate, just (c, N)
+        d = np.sqrt(
+            np.clip((q**2).sum(axis=1)[:, None] + pool_sq[None, :] - 2.0 * q @ pool_x.T,
+                    0.0, None)
+        )
         if pool_block is not None and query_block is not None:
-            valid &= pool_block != query_block[i]
-        idx = np.flatnonzero(valid)
-        if len(idx) == 0:
-            continue
-        k_eff = min(k, len(idx))
-        if rng is not None:
-            sel = rng.choice(idx, size=k_eff, replace=False)
-        else:
-            d = np.linalg.norm(pool_x[idx] - query_x[i], axis=1)
-            sel = idx[np.argpartition(d, k_eff - 1)[:k_eff]]
-        labels = pool_y[sel]
-        means[i] = labels.mean()
-        variances[i] = labels.var()
+            d[pool_block[None, :] == query_block[s : s + q.shape[0], None]] = np.inf
+        # candidate neighbours: k_take smallest distances per row
+        part = np.argpartition(d, k_take - 1, axis=1)[:, :k_take]
+        dpart = np.take_along_axis(d, part, axis=1)
+        valid = np.isfinite(dpart)
+        order = np.argsort(np.where(valid, dpart, np.inf), axis=1)
+        sorted_labels = np.take_along_axis(pool_y[part], order, axis=1)
+        sorted_valid = np.take_along_axis(valid, order, axis=1)
+        counts = sorted_valid.sum(axis=1)
+        k_per = np.minimum(k, counts)
+        take = sorted_valid & (np.arange(k_take)[None, :] < k_per[:, None])
+        denom = np.maximum(k_per, 1)
+        row_mean = (sorted_labels * take).sum(axis=1) / denom
+        row_var = np.clip((sorted_labels**2 * take).sum(axis=1) / denom - row_mean**2, 0.0, None)
+        has = counts > 0
+        sl = slice(s, s + q.shape[0])
+        means[sl] = np.where(has, row_mean, np.nan)
+        variances[sl] = np.where(has, row_var, np.nan)
     return means, variances
 
 

@@ -45,6 +45,9 @@ if str(NAVSIM_V1_ROOT) not in sys.path:
 from navsim.agents.drive_jepa_perception_based.experience.descriptors import (  # noqa: E402
     DESCRIPTOR_FIELDS,
     DESCRIPTOR_FIELD_INDEX as FI,
+    KNN_NUMERIC_FIELDS,
+    TIMING_FIELDS,
+    descriptor_feature_names,
     descriptor_feature_vector,
 )
 from navsim.agents.drive_jepa_perception_based.experience.knn import (  # noqa: E402
@@ -77,12 +80,22 @@ def parse_args():
     p.add_argument("--ks", type=int, nargs="+", default=[8, 32])
     p.add_argument("--num_boot", type=int, default=500)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
+    p.add_argument("--main_vehicle", choices=["noatt", "att"], default="noatt",
+                   help="which stored main vehicle to describe: 'noatt' (default) "
+                        "uses main_desc_noatt, the attribution-free ranking "
+                        "(deployment-feasible, leakage-safe); 'att' uses the "
+                        "GT-attributed top-1 of descriptors[:,0]")
+    p.add_argument("--feature_set", choices=["timing", "full"], default="timing",
+                   help="'timing' (default) excludes min_dist/overlap, which "
+                        "nearly encode the collision label; 'full' keeps all "
+                        "KNN_NUMERIC_FIELDS")
     return p.parse_args()
 
 
-def load_dataset(labels_dir: Path, export_dir: Path) -> List[dict]:
+def load_dataset(labels_dir: Path, export_dir: Path, main_vehicle: str, fields: List[str]) -> List[dict]:
     """Join label + export records into per-scene dicts."""
     scenes = []
+    warned = False
     for lp in sorted(labels_dir.glob("*.npz")):
         ep = export_dir / lp.name
         if not ep.is_file():
@@ -90,12 +103,22 @@ def load_dataset(labels_dir: Path, export_dir: Path) -> List[dict]:
         lab, exp = load_npz(lp), load_npz(ep)
         desc, vmask = lab["descriptors"], lab["vehicle_mask"]
         K = lab["subscores"].shape[0]
-        main_desc = desc[:, 0, :]  # (K, F)
+        if main_vehicle == "noatt" and "main_desc_noatt" in lab:
+            main_desc = lab["main_desc_noatt"]  # (K, F)
+            has_main = np.isfinite(main_desc[:, FI["conflict"]])
+        else:
+            if main_vehicle == "noatt" and not warned:
+                print("[oracle] WARNING: labels lack main_desc_noatt (old labels?) "
+                      "-- falling back to GT-attributed descriptors[:,0]")
+                warned = True
+            main_desc = desc[:, 0, :]  # (K, F)
+            has_main = vmask[:, 0]
         z = np.stack(
             [
                 descriptor_feature_vector(
                     {f: main_desc[k, i] for i, f in enumerate(DESCRIPTOR_FIELDS)},
                     ego_speed=float(lab["ego_speed"].item()),
+                    fields=fields,
                 )
                 for k in range(K)
             ]
@@ -106,7 +129,7 @@ def load_dataset(labels_dir: Path, export_dir: Path) -> List[dict]:
                 log_name=str(lab["log_name"].item()),
                 proposal_feature=np.asarray(exp["proposal_feature"], dtype=np.float32),
                 z=z,
-                has_main_vehicle=vmask[:, 0],
+                has_main_vehicle=has_main,
                 conflict=main_desc[:, FI["conflict"]] == 1.0,
                 dt_enter=np.abs(main_desc[:, FI["dt_enter"]]),
                 subscores=lab["subscores"],
@@ -156,8 +179,11 @@ def main() -> None:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    scenes = load_dataset(Path(args.labels_dir), Path(args.export_dir))
-    print(f"[oracle] {len(scenes)} scenes loaded")
+    fields = TIMING_FIELDS if args.feature_set == "timing" else KNN_NUMERIC_FIELDS
+    scenes = load_dataset(Path(args.labels_dir), Path(args.export_dir),
+                          args.main_vehicle, fields)
+    print(f"[oracle] {len(scenes)} scenes loaded "
+          f"(main_vehicle={args.main_vehicle}, feature_set={args.feature_set})")
     logs = sorted({s["log_name"] for s in scenes})
     groups = split_logs_by_name(logs, ratios=args.ratios, seed=args.seed)
     group_of = {l: g for g, ls in groups.items() for l in ls}
@@ -169,6 +195,7 @@ def main() -> None:
         s["group"] = group_of[s["log_name"]]
 
     results: Dict[str, dict] = {}
+    label_stats: Dict[str, dict] = {}
     rng = np.random.default_rng(args.seed)
 
     for target_name, col in TARGETS.items():
@@ -177,8 +204,24 @@ def main() -> None:
         mem = grp == "memory"
         qtr = grp == "query_train"
         qva = grp == "query_val"
+        # scenes in query_val with at least one positive (unsafe) candidate
+        qva_scenes = np.unique(data["scene_id"][qva])
+        scenes_with_pos = int(
+            sum(data["y"][(data["scene_id"] == s) & qva].any() for s in qva_scenes)
+        )
+        label_stats[target_name] = {
+            "pos_rate": {
+                "memory": float(data["y"][mem].mean()),
+                "query_train": float(data["y"][qtr].mean()),
+                "query_val": float(data["y"][qva].mean()),
+            },
+            "qval_scenes_with_pos": scenes_with_pos,
+            "qval_scenes": int(len(qva_scenes)),
+        }
         print(f"[oracle:{target_name}] rows mem={mem.sum()} qtrain={qtr.sum()} qval={qva.sum()} "
-              f"(unsafe rate mem={data['y'][mem].mean():.3f} qval={data['y'][qva].mean():.3f})")
+              f"| pos-rate mem={data['y'][mem].mean():.3f} qtrain={data['y'][qtr].mean():.3f} "
+              f"qval={data['y'][qva].mean():.3f} "
+              f"| qval scenes w/ pos: {scenes_with_pos}/{len(qva_scenes)}")
 
         # ---- standardization stats on query-train ----
         zm, zs = standardize_fit(data["z"][qtr])
@@ -259,11 +302,23 @@ def main() -> None:
         f"experience retrieval could add; it is not deployable.\n\n"
         f"Scenes: {len(scenes)} | logs: memory={len(groups['memory'])}, "
         f"query_train={len(groups['query_train'])}, query_val={len(groups['query_val'])} "
-        f"| seed={args.seed}\n"
+        f"| seed={args.seed}\n\n"
+        f"main_vehicle=`{args.main_vehicle}` | feature_set=`{args.feature_set}` "
+        f"({', '.join(descriptor_feature_names(fields))})\n\n"
+        f"Label stats:\n" + "\n".join(
+            f"- {t}: pos-rate mem={s['pos_rate']['memory']:.3f} "
+            f"qtrain={s['pos_rate']['query_train']:.3f} "
+            f"qval={s['pos_rate']['query_val']:.3f}; "
+            f"qval scenes with a positive: {s['qval_scenes_with_pos']}/{s['qval_scenes']}"
+            for t, s in label_stats.items()
+        ) + "\n"
     )
     md = [header]
     jsonable = {"note": "oracle upper bound", "scenes": len(scenes),
-                "groups": {k: len(v) for k, v in groups.items()}, "targets": results}
+                "groups": {k: len(v) for k, v in groups.items()},
+                "main_vehicle": args.main_vehicle, "feature_set": args.feature_set,
+                "feature_names": descriptor_feature_names(fields),
+                "label_stats": label_stats, "targets": results}
     for target_name, target_res in results.items():
         for subset_name in ("all", "conflict_subset"):
             md.append(f"\n## {target_name} — {subset_name}\n")
