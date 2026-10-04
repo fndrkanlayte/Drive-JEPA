@@ -300,6 +300,7 @@ def main() -> None:
                 run_batch(feats, metas)
                 feats, metas = [], []
 
+        consec_fail = 0
         for token in tqdm(tokens, desc="export(scenes)"):
             if (out_dir / f"{token}.npz").exists():
                 continue
@@ -309,8 +310,16 @@ def main() -> None:
             except Exception as e:
                 # partially-missing sensor data for this scene -- skip it
                 n_skipped += 1
+                consec_fail += 1
+                if consec_fail >= 50:
+                    raise RuntimeError(
+                        f"{consec_fail} consecutive scenes failed "
+                        f"(last: {e}) -- systemic problem (maps? paths?), "
+                        f"not sparse missing frames"
+                    )
                 print(f"[export] WARNING: skipping {token}: {e}")
                 continue
+            consec_fail = 0
             f: Dict[str, torch.Tensor] = {}
             for b in feature_builders:
                 f.update(b.compute_features(agent_input))
@@ -337,6 +346,11 @@ def main() -> None:
     print(f"[export] wrote {len(records)} records -> {out_dir} (manifest: {manifest})")
     if n_skipped:
         print(f"[export] skipped scenes (missing data): {n_skipped}")
+    if n_skipped and not records:
+        raise RuntimeError(
+            "every attempted scene failed -- check the warnings above "
+            "(systemic problem, e.g. maps/data paths)"
+        )
 
 
 if __name__ == "__main__":
