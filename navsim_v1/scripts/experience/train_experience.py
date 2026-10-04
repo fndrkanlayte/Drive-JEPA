@@ -173,7 +173,7 @@ def build_exp(variant: str, q_lat, q_scene, q_log, mem, args, rng,
     return retrieval_features(
         q_lat, q_scene, q_log, mem["latent"], mem["y"], mem["scene_id"],
         mem["log"], topk=args.topk, max_per_scene=args.max_per_scene,
-        rng=rng, shuffle_labels=shuffle_labels,
+        rng=rng, shuffle_labels=shuffle_labels, device=args.device,
     )
 
 

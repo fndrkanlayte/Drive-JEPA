@@ -31,6 +31,7 @@ def retrieval_features(
     chunk: int = 512,
     rng: Optional[np.random.Generator] = None,
     shuffle_labels: bool = False,
+    device: Optional[str] = None,
 ) -> np.ndarray:
     """Cosine top-k retrieval features per query row.
 
@@ -58,17 +59,33 @@ def retrieval_features(
     out = np.zeros((n, 4 + D), dtype=np.float32)
     # fetch a wider candidate set, then enforce the per-scene cap
     fetch = min(len(ml), max(topk * max_per_scene, topk + 8))
+    use_torch = device is not None
+    if use_torch:
+        import torch
+        q_t = torch.from_numpy(ql).to(device)
+        m_t = torch.from_numpy(ml).to(device)
+        mlid_t = torch.from_numpy(mem_lid).to(device)
+        qlid_t = torch.from_numpy(q_lid).to(device)
     for i0 in range(0, n, chunk):
-        s = ql[i0:i0 + chunk] @ ml.T  # (c, M) cosine sims
-        # mask same-log neighbours (vectorized on int ids)
-        s = np.where(mem_lid[None, :] == q_lid[i0:i0 + chunk, None], -np.inf, s)
-        idx = np.argpartition(-s, fetch - 1, axis=1)[:, :fetch]
-        order = np.argsort(-np.take_along_axis(s, idx, 1), axis=1)
-        idx = np.take_along_axis(idx, order, axis=1)  # (c, fetch) sim-desc
+        if use_torch:
+            s_t = q_t[i0:i0 + chunk] @ m_t.T
+            s_t.masked_fill_(
+                mlid_t[None, :] == qlid_t[i0:i0 + chunk, None], -np.inf)
+            sims, idx = torch.topk(s_t, fetch, dim=1)
+            idx, sims = idx.cpu().numpy(), sims.cpu().numpy()
+        else:
+            s = ql[i0:i0 + chunk] @ ml.T  # (c, M) cosine sims
+            # mask same-log neighbours (vectorized on int ids)
+            s = np.where(mem_lid[None, :] == q_lid[i0:i0 + chunk, None],
+                         -np.inf, s)
+            idx = np.argpartition(-s, fetch - 1, axis=1)[:, :fetch]
+            order = np.argsort(-np.take_along_axis(s, idx, 1), axis=1)
+            idx = np.take_along_axis(idx, order, axis=1)
+            sims = np.take_along_axis(s, idx, 1)
         for bi in range(idx.shape[0]):
             i = i0 + bi
-            si = s[bi, idx[bi]]
-            picked, counts = [], {}
+            si = sims[bi]
+            picked, picked_s, counts = [], [], {}
             for jj, j in enumerate(idx[bi]):
                 if not np.isfinite(si[jj]):
                     break
@@ -77,12 +94,14 @@ def retrieval_features(
                     continue
                 counts[sc] = counts.get(sc, 0) + 1
                 picked.append(j)
+                picked_s.append(si[jj])
                 if len(picked) == topk:
                     break
             if not picked:
                 continue
             picked = np.asarray(picked)
-            w = np.exp(s[bi, picked] - s[bi, picked].max())
+            picked_s = np.asarray(picked_s)
+            w = np.exp(picked_s - picked_s.max())
             w /= w.sum()
             lab = labels[picked]  # (k, 2)
             mean = (w[:, None] * lab).sum(0)
