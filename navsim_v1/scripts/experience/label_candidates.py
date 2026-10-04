@@ -10,6 +10,11 @@ script reproduces the training-side scoring of
     subscores        (32, 6)   float32  [NC, DAC, EP, TTC, Comfort, final]
     descriptors      (32, M, F) float32  per-candidate top-M vehicle descriptors
                      (field order: descriptors.DESCRIPTOR_FIELDS, see schema.json)
+                     slots ordered by the GT-attribution ranking
+    main_desc_noatt  (32, F)   float32  descriptor of the top-1 vehicle under
+                     the attribution-free ranking (conflict > |dt_enter| >
+                     min_dist > |rel_x|) — the leakage-safe main vehicle
+    main_vehicle_token_noatt (32,) str  token of main_desc_noatt ('' if none)
     vehicle_mask     (32, M)   bool     slot is a real vehicle
     main_vehicle_token (32,)   str      token of descriptors[k,0] ('' if none)
     att_fault_tokens (32,)     str      ';'-joined newly at-fault collided tokens
@@ -71,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--max_scenes", type=int, default=None)
     p.add_argument("--token_list", type=str, default=None)
+    p.add_argument("--cache_type", choices=["auto", "train", "official"], default="auto",
+                   help="metric cache flavour: 'train' = navtrain train_metric_cache "
+                        "(stores pdm_progress), 'official' = navtest metric_cache "
+                        "(recomputes reference progress); 'auto' infers it from "
+                        "the presence of pdm_progress")
     p.add_argument("--top_m", type=int, default=4)
     p.add_argument("--prefilter_dist", type=float, default=50.0,
                    help="only describe vehicles within this distance [m] of the "
@@ -126,6 +136,7 @@ def label_scene(
     out_path: str,
     top_m: int,
     prefilter_dist: float,
+    cache_type: str = "auto",
 ) -> str:
     """Label one exported scene; returns out_path."""
     from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -145,10 +156,15 @@ def label_scene(
 
     # ---- simulate + score exactly like get_sub_score -------------------------
     simulated_states = cns.before_score(metric_cache, proposals)  # (K, 41, 11)
-    pdm_progress = getattr(metric_cache, "pdm_progress", None)
-    if pdm_progress is None:
-        # official navtest metric cache: recompute the reference progress
+    if cache_type == "train":
+        pdm_progress = metric_cache.pdm_progress
+    elif cache_type == "official":
         pdm_progress = _pdm_reference_progress(metric_cache, cns)
+    else:
+        pdm_progress = getattr(metric_cache, "pdm_progress", None)
+        if pdm_progress is None:
+            # official navtest metric cache: recompute the reference progress
+            pdm_progress = _pdm_reference_progress(metric_cache, cns)
 
     final_scores = cns.scorer.score_proposals(
         simulated_states,
@@ -198,6 +214,8 @@ def label_scene(
     descriptors = np.full((num_cand, top_m, NUM_DESCRIPTOR_FIELDS), np.nan, dtype=np.float32)
     vehicle_mask = np.zeros((num_cand, top_m), dtype=bool)
     main_vehicle_token = np.array([""] * num_cand, dtype=object)
+    main_desc_noatt = np.full((num_cand, NUM_DESCRIPTOR_FIELDS), np.nan, dtype=np.float32)
+    main_vehicle_token_noatt = np.array([""] * num_cand, dtype=object)
     fault_vehicle_flag = np.zeros(num_cand, dtype=bool)
 
     for k in range(num_cand):
@@ -257,6 +275,12 @@ def label_scene(
             vehicle_mask[k, rank] = True
             if rank == 0:
                 main_vehicle_token[k] = desc_tokens[di]
+        # attribution-free top-1: the deployment-feasible "main vehicle"
+        order_noatt = select_top_m_vehicles(descs, 1, use_attribution=False)
+        if order_noatt:
+            di = order_noatt[0]
+            main_desc_noatt[k] = [descs[di][f] for f in DESCRIPTOR_FIELDS]
+            main_vehicle_token_noatt[k] = desc_tokens[di]
 
     # ---- misc labels ----------------------------------------------------------
     es = np.asarray(rec["ego_status"], dtype=np.float64) if "ego_status" in rec else np.full(11, np.nan)
@@ -276,6 +300,8 @@ def label_scene(
         descriptors=descriptors,
         vehicle_mask=vehicle_mask,
         main_vehicle_token=np.asarray(main_vehicle_token, dtype=object),
+        main_desc_noatt=main_desc_noatt,
+        main_vehicle_token_noatt=np.asarray(main_vehicle_token_noatt, dtype=object),
         att_fault_tokens=np.asarray([";".join(t) for t in att_fault], dtype=object),
         att_ttc_tokens=np.asarray([";".join(t) for t in att_ttc], dtype=object),
         fault_vehicle_flag=fault_vehicle_flag,
@@ -317,7 +343,8 @@ def main() -> None:
     errors = 0
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(label_scene, rp, mcp, op, args.top_m, args.prefilter_dist): rp
+            pool.submit(label_scene, rp, mcp, op, args.top_m, args.prefilter_dist,
+                        args.cache_type): rp
             for rp, mcp, op in jobs
         }
         for i, fut in enumerate(as_completed(futures)):
@@ -346,6 +373,12 @@ def main() -> None:
                     "deployment must not use GT attribution to choose vehicles. "
                     "rel_x/rel_y are in the ego-box-centroid frame at t=0.",
         },
+        "main_desc_noatt": "float32 (num_candidates, num_fields) - descriptor of "
+                           "the top-1 vehicle under the attribution-free ranking "
+                           "(conflict > |dt_enter| > min_dist > |rel_x|); NaN row "
+                           "when no vehicle was described. Leakage-safe default "
+                           "for oracle_knn_check.",
+        "main_vehicle_token_noatt": "track token of main_desc_noatt ('' if none)",
         "vehicle_mask": "bool (num_candidates, top_m) - real vehicle in slot",
         "main_vehicle_token": "track token of descriptors[:,0] ('' if none)",
         "descriptor_feature_vector": descriptor_feature_names(),

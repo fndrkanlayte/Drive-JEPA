@@ -74,8 +74,11 @@ DESCRIPTOR_FIELDS: List[str] = [
 DESCRIPTOR_FIELD_INDEX: Dict[str, int] = {f: i for i, f in enumerate(DESCRIPTOR_FIELDS)}
 NUM_DESCRIPTOR_FIELDS = len(DESCRIPTOR_FIELDS)
 
-# Subset of fields used for the kNN / parametric descriptor predictors in
+# Fields used for the kNN / parametric descriptor predictors in
 # oracle_knn_check.py (itype is appended separately as one-hot).
+# att_collision/att_ttc are deliberately NOT features: they are GT labels
+# (NC<1 is essentially "some vehicle newly at-fault collided"), so feeding
+# them in would leak the target into the oracle check.
 KNN_NUMERIC_FIELDS: List[str] = [
     "conflict",
     "dt_enter",
@@ -85,14 +88,30 @@ KNN_NUMERIC_FIELDS: List[str] = [
     "rel_y",
     "rel_heading",
     "speed",
-    "att_collision",
-    "att_ttc",
     "overlap",
     "k_in_censored",
     "k_out_censored",
     "j_in_censored",
     "j_out_censored",
     "multi_entry",
+]
+
+# Leakage-safe default feature set (--feature_set timing): additionally drops
+# min_dist and overlap, which nearly encode the collision label themselves
+# (a collision implies min_dist~0 and overlapping occupancy intervals).
+TIMING_FIELDS: List[str] = [
+    "conflict",
+    "dt_enter",
+    "pet",
+    "k_in_censored",
+    "k_out_censored",
+    "j_in_censored",
+    "j_out_censored",
+    "multi_entry",
+    "rel_x",
+    "rel_y",
+    "rel_heading",
+    "speed",
 ]
 
 
@@ -223,43 +242,59 @@ def compute_interaction_descriptor(
     return desc
 
 
-def descriptor_sort_key(desc: Dict[str, float]) -> Tuple:
+def descriptor_sort_key(desc: Dict[str, float], use_attribution: bool = True) -> Tuple:
     """Ordering key for ranking vehicles of one candidate.
 
-    Priority: attributed collision > attributed TTC > conflict with smallest
-    |dt_enter| > smallest min_dist > arbitrary (rel_x for determinism).
+    With attribution (TRAINING-SIDE labels only): attributed collision >
+    attributed TTC > conflict with smallest |dt_enter| > smallest min_dist >
+    |rel_x| (deterministic tiebreak).
+    Without attribution (deployment-feasible): conflict with smallest
+    |dt_enter| > smallest min_dist > |rel_x|.
     """
     dt_enter = desc["dt_enter"]
     min_dist = desc["min_dist"]
-    return (
-        -desc["att_collision"],
-        -desc["att_ttc"],
+    key = (
         -desc["conflict"],
         abs(dt_enter) if np.isfinite(dt_enter) else np.inf,
         min_dist if np.isfinite(min_dist) else np.inf,
         abs(desc["rel_x"]) if np.isfinite(desc["rel_x"]) else np.inf,
     )
+    if use_attribution:
+        return (-desc["att_collision"], -desc["att_ttc"]) + key
+    return key
 
 
-def select_top_m_vehicles(descs: List[Dict[str, float]], m: int) -> List[int]:
+def select_top_m_vehicles(
+    descs: List[Dict[str, float]], m: int, use_attribution: bool = True
+) -> List[int]:
     """Return indices of the top-m vehicles for one candidate, sorted by priority.
 
-    Index 0 of the returned list is the "main vehicle". NOTE: the ranking uses
-    GT attribution flags (att_collision / att_ttc), which is a TRAINING-SIDE
-    label — deployment must not use GT attribution to choose vehicles.
+    Index 0 of the returned list is the "main vehicle".
+
+    :param use_attribution: True ranks by GT attribution flags first
+        (att_collision / att_ttc) — a TRAINING-SIDE label; deployment must not
+        use GT attribution to choose vehicles. False uses only
+        deployment-available quantities (conflict / timing / distance).
     """
-    order = sorted(range(len(descs)), key=lambda i: descriptor_sort_key(descs[i]))
+    order = sorted(
+        range(len(descs)), key=lambda i: descriptor_sort_key(descs[i], use_attribution)
+    )
     return order[:m]
 
 
-def descriptor_feature_vector(desc: Dict[str, float], ego_speed: float = np.nan) -> np.ndarray:
+def descriptor_feature_vector(
+    desc: Dict[str, float],
+    ego_speed: float = np.nan,
+    fields: Optional[List[str]] = None,
+) -> np.ndarray:
     """Flatten a descriptor (+ ego speed) to a fixed-size float32 feature vector.
 
-    Layout: KNN_NUMERIC_FIELDS + ego_speed + itype one-hot (same/cross/oncoming)
-    + has_conflict... actually itype one-hot covers NONE vs classes.
+    Layout: `fields` (default KNN_NUMERIC_FIELDS) + ego_speed + itype one-hot
+    (same/cross/oncoming). Pass TIMING_FIELDS for the leakage-safe default.
     NaNs are preserved; callers standardize then fill NaN with 0 (mean impute).
     """
-    vec = [desc[f] for f in KNN_NUMERIC_FIELDS]
+    fields = KNN_NUMERIC_FIELDS if fields is None else fields
+    vec = [desc[f] for f in fields]
     vec.append(ego_speed)
     itype = int(desc["itype"]) if np.isfinite(desc["itype"]) else ITYPE_NONE
     vec.extend([
@@ -270,6 +305,7 @@ def descriptor_feature_vector(desc: Dict[str, float], ego_speed: float = np.nan)
     return np.asarray(vec, dtype=np.float32)
 
 
-def descriptor_feature_names() -> List[str]:
+def descriptor_feature_names(fields: Optional[List[str]] = None) -> List[str]:
     """Names matching descriptor_feature_vector layout (for schema/debug)."""
-    return KNN_NUMERIC_FIELDS + ["ego_speed", "itype_same_dir", "itype_crossing", "itype_oncoming"]
+    fields = KNN_NUMERIC_FIELDS if fields is None else fields
+    return list(fields) + ["ego_speed", "itype_same_dir", "itype_crossing", "itype_oncoming"]

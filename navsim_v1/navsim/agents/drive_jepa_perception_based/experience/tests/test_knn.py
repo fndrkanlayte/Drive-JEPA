@@ -57,6 +57,40 @@ class TestKnnPredict:
         # same-log pool rows excluded -> only the "B" row remains
         assert mean[0] == pytest.approx(0.0)
 
+    def test_chunked_matches_bruteforce(self):
+        """Vectorized path must equal a naive per-row loop incl. block masking."""
+        rng = np.random.default_rng(1)
+        n, m, d = 500, 130, 8
+        pool_x = rng.normal(size=(n, d))
+        pool_y = (rng.uniform(size=n) > 0.7).astype(float)
+        query_x = rng.normal(size=(m, d))
+        pool_block = rng.choice(["A", "B", "C"], size=n).astype(object)
+        query_block = rng.choice(["A", "B", "C"], size=m).astype(object)
+        k = 8
+        mean, var = knn_predict(
+            pool_x, pool_y, query_x, k,
+            pool_block=pool_block, query_block=query_block, chunk_size=64,
+        )
+        for i in range(m):
+            valid = np.flatnonzero(pool_block != query_block[i])
+            k_eff = min(k, len(valid))
+            dd = np.linalg.norm(pool_x[valid] - query_x[i], axis=1)
+            sel = valid[np.argsort(dd)[:k_eff]]
+            assert mean[i] == pytest.approx(pool_y[sel].mean(), abs=1e-9)
+            assert var[i] == pytest.approx(pool_y[sel].var(), abs=1e-9)
+
+    def test_chunked_tiny_pool(self):
+        """k > available valid neighbours must not crash or pick masked rows."""
+        pool_x = np.array([[0.0], [0.1], [5.0]])
+        pool_y = np.array([1.0, 1.0, 0.0])
+        pool_block = np.array(["A", "A", "B"], dtype=object)
+        mean, var = knn_predict(
+            pool_x, pool_y, np.array([[0.0], [5.0]]), k=8,
+            pool_block=pool_block, query_block=np.array(["A", "A"], dtype=object),
+        )
+        assert mean[0] == pytest.approx(0.0)  # only row "B" valid
+        assert var[0] == pytest.approx(0.0)
+
     def test_random_neighbours(self):
         rng = np.random.default_rng(0)
         pool_x = np.arange(20, dtype=float).reshape(-1, 1)

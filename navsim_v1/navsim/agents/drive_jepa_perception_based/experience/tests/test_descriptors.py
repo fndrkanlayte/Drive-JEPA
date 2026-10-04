@@ -10,7 +10,9 @@ from navsim.agents.drive_jepa_perception_based.experience.descriptors import (
     ITYPE_NONE,
     ITYPE_ONCOMING,
     ITYPE_SAME_DIR,
+    KNN_NUMERIC_FIELDS,
     NUM_DESCRIPTOR_FIELDS,
+    TIMING_FIELDS,
     compute_interaction_descriptor,
     descriptor_feature_names,
     descriptor_feature_vector,
@@ -189,6 +191,45 @@ class TestRanking:
             for i in range(6)
         ]
         assert len(select_top_m_vehicles(descs, 4)) == 4
+
+
+class TestLeakageGuards:
+    def test_att_flags_not_in_features(self):
+        """att_collision/att_ttc must never enter the feature vector."""
+        assert "att_collision" not in KNN_NUMERIC_FIELDS
+        assert "att_ttc" not in KNN_NUMERIC_FIELDS
+        assert "att_collision" not in TIMING_FIELDS
+        assert "att_ttc" not in TIMING_FIELDS
+        d_att = compute_interaction_descriptor(
+            ego_seq(), j_seq(x=6.0), 0.0, 0.0, att_collision=True, att_ttc=True
+        )
+        d_plain = compute_interaction_descriptor(ego_seq(), j_seq(x=6.0), 0.0, 0.0)
+        for fields in (None, TIMING_FIELDS):
+            v_att = descriptor_feature_vector(d_att, 5.0, fields)
+            v_plain = descriptor_feature_vector(d_plain, 5.0, fields)
+            assert np.allclose(
+                np.nan_to_num(v_att), np.nan_to_num(v_plain)
+            ), "feature vector must be identical with/without att flags"
+
+    def test_noatt_ordering_ignores_attribution(self):
+        """use_attribution=False ranks by conflict/timing only."""
+        att_far = compute_interaction_descriptor(
+            ego_seq(), j_seq(x=50.0), 0.0, 0.0, att_collision=True
+        )
+        conflict_near = compute_interaction_descriptor(
+            ego_seq(), j_seq(x=6.0), 0.0, 0.0
+        )
+        # with attribution: the flagged (conflict-free!) vehicle still wins
+        assert select_top_m_vehicles([att_far, conflict_near], 1) == [0]
+        # without attribution: the conflicting vehicle wins
+        assert select_top_m_vehicles([att_far, conflict_near], 1, use_attribution=False) == [1]
+
+    def test_timing_excludes_near_label_fields(self):
+        assert "min_dist" not in TIMING_FIELDS
+        assert "overlap" not in TIMING_FIELDS
+        d = compute_interaction_descriptor(ego_seq(), j_seq(x=6.0), 0.0, 0.0, j_speed=1.0)
+        v = descriptor_feature_vector(d, 5.0, TIMING_FIELDS)
+        assert len(v) == len(descriptor_feature_names(TIMING_FIELDS))
 
 
 class TestFeatureVector:
