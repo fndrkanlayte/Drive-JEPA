@@ -235,14 +235,25 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
     tr_idx = np.flatnonzero(tr)
     va_idx = np.flatnonzero(va)
     q_idx = np.concatenate([tr_idx, va_idx])  # experience feats only for queries
+    needs_latent = exp_dim_for(variant, 64) > 4  # retrieval variants only
+
+    # noexp/random exp feats don't depend on the encoder -- build once
+    exp_static = None
+    if not needs_latent:
+        exp_static = build_exp(variant, np.zeros((len(q_idx), 1), np.float32),
+                               rows["scene_id"][q_idx], rows["log"][q_idx],
+                               mem, args, rng)
 
     for epoch in range(args.epochs):
         # re-encode memory + queries with current weights; exp feats are
         # detached inputs for this epoch (encoder still learns via latent)
-        mem["latent"] = encode_rows(model, mem_x, device=device)
-        q_lat = encode_rows(model, x_all[q_idx], device=device)
-        exp = build_exp(variant, q_lat, rows["scene_id"][q_idx],
-                        rows["log"][q_idx], mem, args, rng)
+        if needs_latent:
+            mem["latent"] = encode_rows(model, mem_x, device=device)
+            q_lat = encode_rows(model, x_all[q_idx], device=device)
+            exp = build_exp(variant, q_lat, rows["scene_id"][q_idx],
+                            rows["log"][q_idx], mem, args, rng)
+        else:
+            exp = exp_static
         exp_tr = torch.from_numpy(exp[: len(tr_idx)])
         model.train()
         perm = rng.permutation(len(tr_idx))
@@ -261,10 +272,14 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
             opt.step()
 
     # final predictions on query rows with the trained encoder
-    mem["latent"] = encode_rows(model, mem_x, device=device)
-    q_lat = encode_rows(model, x_all[q_idx], device=device)
-    exp = build_exp(variant, q_lat, rows["scene_id"][q_idx], rows["log"][q_idx],
-                    mem, args, np.random.default_rng(seed + 777))
+    if needs_latent:
+        mem["latent"] = encode_rows(model, mem_x, device=device)
+        q_lat = encode_rows(model, x_all[q_idx], device=device)
+        exp = build_exp(variant, q_lat, rows["scene_id"][q_idx],
+                        rows["log"][q_idx], mem, args,
+                        np.random.default_rng(seed + 777))
+    else:
+        exp = exp_static
     pred = predict(model, x_all[q_idx], exp, device)
     out = {"model": model, "val": pred[len(tr_idx):]}
     if variant == "retrieval":

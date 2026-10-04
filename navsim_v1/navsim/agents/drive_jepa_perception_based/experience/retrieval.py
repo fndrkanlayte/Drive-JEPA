@@ -95,9 +95,12 @@ def random_features(
 ) -> np.ndarray:
     """Label mean/var (4) of ``topk`` random memory candidates from other logs."""
     r = rng if rng is not None else np.random.default_rng(0)
+    # cache the exclusion pool once per distinct query log (O(|logs| * M),
+    # not O(N * M) rescans of the string array)
+    pools = {lg: np.flatnonzero(mem_log != lg) for lg in np.unique(q_log)}
     out = np.zeros((n, 4), dtype=np.float32)
     for i in range(n):
-        pool = np.flatnonzero(mem_log != q_log[i])
+        pool = pools[q_log[i]]
         if len(pool) == 0:
             continue
         idx = r.choice(pool, size=min(topk, len(pool)), replace=False)
