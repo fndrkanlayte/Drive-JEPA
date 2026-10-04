@@ -204,11 +204,15 @@ def main() -> None:
         with torch.no_grad():
             batch = collate(feature_list, device)
             out = agent(batch)
+            tokens_feat = captured["tokens"]  # (B, P, T, D)
             ref_out = None
             todo = min(len(meta_list), max(0, args.check_consistency - n_checked))
             if todo > 0:
-                ref_out = agent(batch)
-        tokens_feat = captured["tokens"]  # (B, P, T, D)
+                # model.forward mutates the feature dict in place (lidar2img
+                # slice, ego_status b2d zeroing), so a second call on the same
+                # batch sees an empty camera axis. Re-collate a fresh batch
+                # instead -- this is also a truer determinism re-forward.
+                ref_out = agent(collate(feature_list, device))
         proposal_feature = tokens_feat.amax(-2)  # (B, P, D)
         proposals = out["proposals"].float().cpu().numpy()
         pred_logit = out["pred_logit"].float().cpu().numpy()
