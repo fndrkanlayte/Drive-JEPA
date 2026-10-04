@@ -92,12 +92,25 @@ def parse_args() -> argparse.Namespace:
 # Per-scene worker (module level for multiprocessing pickling)
 # --------------------------------------------------------------------------- #
 
-def _metric_cache_map(metric_cache_dir: Path) -> Dict[str, str]:
-    """token -> metric_cache.pkl path, using MetricCacheLoader's metadata csv."""
-    from navsim.common.dataloader import MetricCacheLoader
+_METRIC_CACHE_FILE = "metric_cache.pkl"
 
-    loader = MetricCacheLoader(Path(metric_cache_dir))
-    return {t: str(p) for t, p in loader.metric_cache_paths.items()}
+
+def _metric_cache_map(metric_cache_dir: Path) -> Dict[str, str]:
+    """token -> metric_cache.pkl path by scanning the local cache tree.
+
+    Layout is ``<cache_dir>/<log_token>/<agent>/<token>/metric_cache.pkl``;
+    the token is the scene directory name. MetricCacheLoader's metadata csv
+    stores absolute paths baked at generation time, which are stale on any
+    other machine, so we glob the real files instead.
+    """
+    mapping = {}
+    for p in Path(metric_cache_dir).glob(f"*/*/*/{_METRIC_CACHE_FILE}"):
+        mapping[p.parent.name] = str(p)
+    if not mapping:
+        raise FileNotFoundError(
+            f"no */*/*/{_METRIC_CACHE_FILE} under {metric_cache_dir}"
+        )
+    return mapping
 
 
 def _load_metric_cache(path: str):
