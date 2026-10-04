@@ -51,6 +51,7 @@ from navsim.agents.drive_jepa_perception_based.experience.descriptors import (  
     descriptor_feature_vector,
 )
 from navsim.agents.drive_jepa_perception_based.experience.knn import (  # noqa: E402
+    eval_with_ci,
     knn_predict,
     metric_bundle,
     predict_proba_or_prior,
@@ -159,23 +160,6 @@ def flatten(scenes: List[dict], target_col: int, dt_enter_thresh: float = 2.0):
         )
     return {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
 
-
-def eval_with_ci(pred, y, scene_ids, num_boot, seed):
-    """Metrics + scene-level bootstrap 95% CIs."""
-    point = metric_bundle(pred, y, scene_ids)
-    scenes = np.unique(scene_ids)
-    rng = np.random.default_rng(seed)
-    boots = {m: np.empty(num_boot) for m in point}
-    for b in range(num_boot):
-        keep = rng.choice(scenes, size=len(scenes), replace=True)
-        idx = np.concatenate([np.flatnonzero(scene_ids == s) for s in keep])
-        sid_map = np.repeat(np.arange(len(keep)), [int((scene_ids == s).sum()) for s in keep])
-        for m, v in metric_bundle(pred[idx], y[idx], sid_map).items():
-            boots[m][b] = v
-    return {
-        m: (point[m], float(np.nanpercentile(v, 2.5)), float(np.nanpercentile(v, 97.5)))
-        for m, v in boots.items()
-    }
 
 
 def main() -> None:
