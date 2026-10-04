@@ -95,7 +95,7 @@ def parse_args():
 def load_dataset(labels_dir: Path, export_dir: Path, main_vehicle: str, fields: List[str]) -> List[dict]:
     """Join label + export records into per-scene dicts."""
     scenes = []
-    warned = False
+    missing_noatt = 0
     for lp in sorted(labels_dir.glob("*.npz")):
         ep = export_dir / lp.name
         if not ep.is_file():
@@ -107,10 +107,7 @@ def load_dataset(labels_dir: Path, export_dir: Path, main_vehicle: str, fields: 
             main_desc = lab["main_desc_noatt"]  # (K, F)
             has_main = np.isfinite(main_desc[:, FI["conflict"]])
         else:
-            if main_vehicle == "noatt" and not warned:
-                print("[oracle] WARNING: labels lack main_desc_noatt (old labels?) "
-                      "-- falling back to GT-attributed descriptors[:,0]")
-                warned = True
+            missing_noatt += int(main_vehicle == "noatt")
             main_desc = desc[:, 0, :]  # (K, F)
             has_main = vmask[:, 0]
         z = np.stack(
@@ -134,6 +131,13 @@ def load_dataset(labels_dir: Path, export_dir: Path, main_vehicle: str, fields: 
                 dt_enter=np.abs(main_desc[:, FI["dt_enter"]]),
                 subscores=lab["subscores"],
             )
+        )
+    if missing_noatt:
+        raise ValueError(
+            f"{missing_noatt} label file(s) lack main_desc_noatt, so "
+            f"--main_vehicle noatt cannot be honored without leaking GT "
+            f"attribution. Re-run label_candidates (which now writes both "
+            f"orderings), or pass --main_vehicle att explicitly."
         )
     return scenes
 
