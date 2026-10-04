@@ -85,11 +85,13 @@ def build_agent(checkpoint: str, agent_config: str, agent_overrides: List[str]):
     from hydra.utils import instantiate
     from hydra.core.global_hydra import GlobalHydra
 
-    config_dir = NAVSIM_V1_ROOT / "navsim" / "planning" / "script" / "config" / "common"
+    # Same config entrypoint as run_pdm_score.py: default_run_pdm_score pulls in
+    # default_common + default_evaluation + an `agent` group we can override.
+    config_dir = NAVSIM_V1_ROOT / "navsim" / "planning" / "script" / "config" / "pdm_scoring"
     GlobalHydra.instance().clear()
     with hydra.initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = hydra.compose(
-            config_name="default_common",
+            config_name="default_run_pdm_score",
             overrides=[f"agent={agent_config}", f"agent.checkpoint_path={checkpoint}"]
             + list(agent_overrides),
         )
