@@ -142,7 +142,7 @@ key, zp, a, yh, sub, b0s, oc, logs = gather_query_arrays()
 conf_scene = (oc[:, :, 0] > 0).any(1)
 best = sub[..., 5].max(1)
 b0_pick = b0s.argmax(1)
-f_b0 = sub[np.arange(len(sub)), b0_pick]
+f_b0 = sub[..., 5][np.arange(len(sub)), b0_pick]
 b0_wrong = f_b0 < best - 0.05
 
 

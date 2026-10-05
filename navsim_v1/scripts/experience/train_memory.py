@@ -183,7 +183,7 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
             dflat[sl] = dl.cpu().numpy()
             sc = score_with_delta(torch.from_numpy(b0[sl]).to(device), dl)
             picks[sl] = sc.argmax(1).cpu().numpy()
-            finals[sl] = torch.from_numpy(sub[sl])[
+            finals[sl] = torch.from_numpy(sub[sl][..., 5])[
                 torch.arange(len(sc)), picks[sl]].numpy()
     return finals, picks, sub, b0, logs, dflat
 
@@ -344,9 +344,9 @@ def main():
             bank, keynet, memenc, delta, val_ds, device)
         vf_s, _, _, _, _, _ = eval_selection(
             bank, keynet, memenc, delta, val_ds, device, shuffle=True)
-        vf_b0 = sub[np.arange(len(sub)), b0v.argmax(1)]
-        n_hard = int((sub[np.arange(len(sub)), b0v.argmax(1)] <
-                      sub[..., 5].max(1) - 0.05).sum())
+        sub_f = sub[..., 5]
+        vf_b0 = sub_f[np.arange(len(sub)), b0v.argmax(1)]
+        n_hard = int((vf_b0 < sub_f.max(1) - 0.05).sum())
         rec = dict(epoch=ep, loss=ep_loss / nb, lret=ep_ret / nb,
                    lmain=ep_main / nb, lc=ep_c / nb,
                    val_final=float(vf.mean()),
