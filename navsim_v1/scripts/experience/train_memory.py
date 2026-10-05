@@ -229,6 +229,10 @@ def main():
                    help="lkeep covers candidates with final < f_b0 - keep_tol")
     p.add_argument("--lc_sg", action="store_true",
                    help="stop-gradient on shuffled-memory branch of L_c")
+    p.add_argument("--grad_clip", type=float, default=0.0,
+                   help="clip global grad norm; 0 disables")
+    p.add_argument("--freeze_keynet", action="store_true",
+                   help="freeze KeyNet after epoch 0 (retrieval drift test)")
     p.add_argument("--eval_half", action="store_true",
                    help="run val eval twice per epoch (half and end)")
     p.add_argument("--k", type=int, default=K_RETR)
@@ -348,7 +352,8 @@ def main():
                    secs=round(time.time() - t0, 1))
         hist.append(rec)
         print(f"[mem] {tag} loss={ldict['loss']:.4f} lret={ldict['lret']:.4f} "
-              f"lc={ldict['lc']:.4f} val={rec['val_final']:.4f} "
+              f"lc={ldict['lc']:.4f} gn={ldict.get('gn', 0.0):.3f} "
+              f"val={rec['val_final']:.4f} "
               f"shuf={rec['val_final_shuffle']:.4f} "
               f"({rec['val_minus_shuf']:+.4f}) "
               f"b0={rec['val_final_b0']:.4f} "
@@ -361,10 +366,16 @@ def main():
         keynet.train(); memenc.train(); delta.train()
         return rec, vf.mean()
 
+    key_frozen = False
     for ep in range(args.epochs):
+        if args.freeze_keynet and ep >= 1 and not key_frozen:
+            for pp in keynet.parameters():
+                pp.requires_grad_(False)
+            key_frozen = True
+            print("[mem] KeyNet frozen for ep>=1", flush=True)
         t0 = time.time()
         keynet.train(); memenc.train(); delta.train()
-        ep_loss = ep_ret = ep_c = ep_main = 0.0
+        ep_loss = ep_ret = ep_c = ep_main = ep_gn = 0.0
         nb = 0
         loader = DataLoader(train_ds, batch_size=args.batch_size,
                             shuffle=True, num_workers=args.num_workers,
@@ -462,13 +473,17 @@ def main():
             loss = lmain + args.lam_ret * lret
             opt.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                gn = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                ep_gn += float(gn)
             opt.step()
             ep_loss += float(loss); ep_ret += float(lret)
             ep_c += float(lc); ep_main += float(lce)
             nb += 1
             if nb == half_at:
                 ld = dict(loss=ep_loss / nb, lret=ep_ret / nb,
-                          lmain=ep_main / nb, lc=ep_c / nb)
+                          lmain=ep_main / nb, lc=ep_c / nb,
+                          gn=ep_gn / nb)
                 rec, vfm = run_val(f"ep{ep}h", ld, t0)
                 ck = dict(args=vars(args), keynet=keynet.state_dict(),
                           memenc=memenc.state_dict(), delta=delta.state_dict(),
@@ -480,7 +495,8 @@ def main():
 
         # ---- end-of-epoch val ----
         ld = dict(loss=ep_loss / nb, lret=ep_ret / nb,
-                  lmain=ep_main / nb, lc=ep_c / nb)
+                  lmain=ep_main / nb, lc=ep_c / nb,
+                  gn=ep_gn / nb)
         rec, vfm = run_val(f"ep{ep}", ld, t0)
         ck = dict(args=vars(args), keynet=keynet.state_dict(),
                   memenc=memenc.state_dict(), delta=delta.state_dict(),
