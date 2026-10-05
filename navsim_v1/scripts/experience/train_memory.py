@@ -412,12 +412,10 @@ def main():
                     pad_s = pad_s.reshape(B, -1) | drop   # same dropout draw
                     dl_s = delta(at, yf, mem_s, pad_mask=pad_s)
                     sc_s = score_with_delta(b0_t, dl_s)
-                    ldr_s = (dl_s - dl_s.mean(1, keepdim=True)).pow(2).mean()
                     if args.loss == "top1":
                         l_s, _ = top1_loss(sc_s, b0_t, final,
                                            lam_kl=args.lam_kl,
                                            lam_keep=args.lam_keep)
-                        l_s = l_s + args.lam_dreg * ldr_s
                         l_ref = lcore
                     else:
                         l_s = listwise_ce(sc_s, final, weight=hw)
