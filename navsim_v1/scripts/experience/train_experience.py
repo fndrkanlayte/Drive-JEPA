@@ -671,7 +671,8 @@ def main() -> None:
         md.append("| " + " | ".join(r) + " |")
     (out_dir / "train_experience_results.md").write_text("\n".join(md) + "\n")
     with open(out_dir / "train_experience_results.json", "w") as f:
-        json.dump({k: {m: list(v) for m, v in res.items()}
+        json.dump({k: {m: (np.asarray(v).tolist() if np.isscalar(v)
+                          else list(v)) for m, v in res.items()}
                    for k, res in results.items()}, f, indent=2)
 
     # ---- navtest risk export (memory = navtrain rows only) ------------------
