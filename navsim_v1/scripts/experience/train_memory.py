@@ -224,7 +224,9 @@ def main():
                    help="top1: KL trust region + fix/keep margins "
                         "(replaces listwise CE + hinge)")
     p.add_argument("--lam_kl", type=float, default=1.0)
-    p.add_argument("--lam_keep", type=float, default=0.5)
+    p.add_argument("--lam_keep", type=float, default=1.0)
+    p.add_argument("--keep_tol", type=float, default=0.005,
+                   help="lkeep covers candidates with final < f_b0 - keep_tol")
     p.add_argument("--eval_half", action="store_true",
                    help="run val eval twice per epoch (half and end)")
     p.add_argument("--k", type=int, default=K_RETR)
@@ -254,7 +256,10 @@ def main():
     cache = Path(args.cache_dir)
     train_ds = CacheDataset(train_tokens, cache)
     val_ds = CacheDataset(val_tokens, cache)
-    print(f"[mem] train={len(train_ds)} val={len(val_ds)}", flush=True)
+    # fixed train-subset eval (2k) to distinguish overfit vs shortcut
+    tr_ds = CacheDataset(train_tokens[:2048], cache)
+    print(f"[mem] train={len(train_ds)} val={len(val_ds)} "
+          f"tr_sub={len(tr_ds)}", flush=True)
 
     # bank for train/val = train split ONLY (val consequences must not
     # leak into memory); navtest eval builds its own full-navtrain bank
@@ -302,9 +307,27 @@ def main():
                           [wrong]).mean()) if wrong.any() else 0.0
         break_rate = float((vf_pick < vf_b0 - 0.05)[~wrong].mean()) \
             if (~wrong).any() else 0.0
+        brk_small = float((vf_pick < vf_b0 - 0.005)[~wrong].mean()) \
+            if (~wrong).any() else 0.0
+        net_fix = float(((vf_pick - vf_b0)[wrong]).mean()
+                        * wrong.mean()) if wrong.any() else 0.0
+        net_break = float(((vf_pick - vf_b0)[~wrong]).mean()
+                          * (~wrong).mean()) if (~wrong).any() else 0.0
         dstd = float((dflat - dflat.mean(1, keepdims=True)).std(1).mean())
         flip = float((picks != b0_pick).mean())
         dgap = float(np.abs(dflat - dflat_s).mean())
+        # train-subset eval (same bank): overfit vs shortcut diagnostic
+        tvf, tpicks, tsub, tb0v, _, _ = eval_selection(
+            bank, keynet, memenc, delta, tr_ds, device)
+        tsub_f = tsub[..., 5]
+        tb0_pick = tb0v.argmax(1)
+        tvf_b0 = tsub_f[np.arange(len(tsub)), tb0_pick]
+        tvf_pick = tsub_f[np.arange(len(tsub)), tpicks]
+        twrong = tvf_b0 < tsub_f.max(1) - 0.05
+        tr_fix = float((((tpicks != tb0_pick) & (tvf_pick > tvf_b0))
+                        [twrong]).mean()) if twrong.any() else 0.0
+        tr_brks = float((tvf_pick < tvf_b0 - 0.005)[~twrong].mean()) \
+            if (~twrong).any() else 0.0
         rec = dict(epoch=tag, **ldict,
                    val_final=float(vf.mean()),
                    val_final_shuffle=float(vf_s.mean()),
@@ -315,6 +338,10 @@ def main():
                    delta_big=float((np.abs(dflat) > 0.1).mean()),
                    dstd=dstd, flip=flip, dgap=dgap,
                    fix_rate=fix_rate, break_rate=break_rate,
+                   brk_small=brk_small, net_fix=net_fix,
+                   net_break=net_break,
+                   tr_val=float(tvf.mean()), tr_fix=tr_fix,
+                   tr_brk_small=tr_brks,
                    n_hard_scenes=n_hard,
                    secs=round(time.time() - t0, 1))
         hist.append(rec)
@@ -325,6 +352,9 @@ def main():
               f"b0={rec['val_final_b0']:.4f} "
               f"dstd={dstd:.4f} flip={flip:.3f} dgap={dgap:.4f} "
               f"fix={fix_rate:.3f} brk={break_rate:.3f} "
+              f"brks={brk_small:.3f} nf={net_fix:+.5f} nb={net_break:+.5f} "
+              f"trv={tvf.mean():.4f} trfix={tr_fix:.3f} "
+              f"trbrks={tr_brks:.3f} "
               f"({rec['secs']}s)", flush=True)
         keynet.train(); memenc.train(); delta.train()
         return rec, vf.mean()
@@ -393,7 +423,8 @@ def main():
                 if args.loss == "top1":
                     lcore, _ = top1_loss(scores, b0_t, final,
                                          lam_kl=args.lam_kl,
-                                         lam_keep=args.lam_keep)
+                                         lam_keep=args.lam_keep,
+                                         keep_tol=args.keep_tol)
                     lmain = lcore + args.lam_dreg * ldr
                 else:
                     lce = listwise_ce(scores, final, weight=hw)
@@ -415,7 +446,8 @@ def main():
                     if args.loss == "top1":
                         l_s, _ = top1_loss(sc_s, b0_t, final,
                                            lam_kl=args.lam_kl,
-                                           lam_keep=args.lam_keep)
+                                           lam_keep=args.lam_keep,
+                                           keep_tol=args.keep_tol)
                         l_ref = lcore
                     else:
                         l_s = listwise_ce(sc_s, final, weight=hw)

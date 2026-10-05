@@ -200,15 +200,15 @@ def pairwise_hinge(scores: torch.Tensor, final: torch.Tensor,
 
 def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
               final: torch.Tensor, lam_kl: float = 1.0,
-              lam_keep: float = 0.5, m: float = 0.5,
-              T: float = 1.0) -> tuple:
+              lam_keep: float = 1.0, m: float = 0.5,
+              T: float = 1.0, keep_tol: float = 0.005) -> tuple:
     """Top-1 anchored objective (Devin Bot spec).
 
     lkl   = KL(softmax(logit_b0/T) || softmax(scores/T))   trust region on all
     lfix  = relu(m - (score[best] - score[b0pick]))        B0-wrong scenes only,
             best = argmax final with B0-logit tie-break
     lkeep = mean_k relu(m - (score[b0pick] - score[k]))    B0-correct scenes,
-            over k with final[k] < final[b0pick] - .05
+            over k with final[k] < final[b0pick] - keep_tol
     returns (lmain, dict of parts) where
     lmain = lfix + lam_keep*lkeep + lam_kl*lkl."""
     logit_b0 = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
@@ -233,7 +233,7 @@ def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
         lfix = scores.new_zeros(())
 
     correct = ~wrong
-    worse_k = final < (f_b0[:, None] - 0.05)
+    worse_k = final < (f_b0[:, None] - keep_tol)
     viol = F.relu(m - (s_b0[:, None] - scores)) * worse_k
     per_scene = viol.sum(1) / worse_k.sum(1).clamp(min=1)
     if correct.any():
