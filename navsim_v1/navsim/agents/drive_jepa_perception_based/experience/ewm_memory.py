@@ -105,10 +105,12 @@ class MemoryDelta(nn.Module):
                      norm(h+ctx1) but Delta = out(ctx2) — memory content only."""
 
     def __init__(self, d: int = D_SCENE, n_heads: int = 4,
-                 no_latent: bool = False, readout: str = "resid"):
+                 no_latent: bool = False, readout: str = "resid",
+                 delta_cap: float = 1.0):
         super().__init__()
         self.no_latent = no_latent
         self.readout = readout
+        self.delta_cap = delta_cap
         self.q_proj = nn.Linear(D_SCENE + (0 if no_latent else N_SLOTS * D_LAT),
                                 d)
         self.attn = nn.ModuleList(
@@ -148,6 +150,9 @@ class MemoryDelta(nn.Module):
                 ctx, _ = attn(h, mem, mem, key_padding_mask=pad_mask)
                 h = norm(h + ctx)
             d = self.out(h).squeeze(-1)
+        if self.delta_cap > 0:
+            c = self.delta_cap
+            d = c * torch.tanh(d / c)
         if fully is not None:
             d = d * (~fully).float().unsqueeze(-1)
         return d

@@ -226,6 +226,20 @@ def test_hinge_prefers_better_final():
     assert l_up < l_good < l_down
 
 
+def test_delta_cap_bounds_and_zero_init():
+    cap = 0.5
+    delta = MemoryDelta(delta_cap=cap)
+    a = torch.randn(2, K, D_SCENE)
+    yh = torch.randn(2, K, N_SLOTS * D_LAT)
+    mem = torch.randn(2, 8, D_SCENE)
+    d = delta(a, yh, mem)
+    assert torch.allclose(d, torch.zeros_like(d))      # zero-init intact
+    torch.nn.init.normal_(delta.out.weight, std=5.0)   # force large raw delta
+    d = delta(a, yh, mem)
+    assert d.abs().max() <= cap + 1e-6
+    assert (d.abs() > 0).any()                         # cap doesn't zero it
+
+
 def test_retrieval_kl_runs():
     g = KeyNet()
     ks = torch.randn(6, 512)

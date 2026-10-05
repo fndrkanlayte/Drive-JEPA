@@ -213,6 +213,8 @@ def main():
     p.add_argument("--lam_hinge", type=float, default=1.0)
     p.add_argument("--lam_c", type=float, default=1.0)
     p.add_argument("--lam_dreg", type=float, default=0.01)
+    p.add_argument("--delta_cap", type=float, default=1.0,
+                   help="tanh cap on delta magnitude; <=0 disables")
     p.add_argument("--k", type=int, default=K_RETR)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_scenes", type=int, default=None)
@@ -248,7 +250,8 @@ def main():
     keynet = KeyNet().to(device)
     memenc = MemTokenEnc(no_latent=args.no_latent).to(device)
     delta = MemoryDelta(no_latent=args.no_latent,
-                        readout=args.readout).to(device)
+                        readout=args.readout,
+                        delta_cap=args.delta_cap).to(device)
     if args.key_ckpt:
         keynet.load_state_dict(torch.load(args.key_ckpt, map_location="cpu"))
         print(f"[mem] loaded key_ckpt {args.key_ckpt}", flush=True)

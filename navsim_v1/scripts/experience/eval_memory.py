@@ -65,10 +65,12 @@ ckpt = torch.load(Path(args.run) / "model_best.pt", map_location="cpu",
 ck_args = ckpt.get("args", {})
 no_latent = bool(ck_args.get("no_latent", False))
 readout = ck_args.get("readout", "resid")
+delta_cap = float(ck_args.get("delta_cap", 1.0))
 keynet = KeyNet().to(device); keynet.load_state_dict(ckpt["keynet"])
 memenc = MemTokenEnc(no_latent=no_latent).to(device)
 memenc.load_state_dict(ckpt["memenc"])
-delta = MemoryDelta(no_latent=no_latent, readout=readout).to(device)
+delta = MemoryDelta(no_latent=no_latent, readout=readout,
+                    delta_cap=delta_cap).to(device)
 delta.load_state_dict(ckpt["delta"])
 keynet.eval(); memenc.eval(); delta.eval()
 for m in (keynet, memenc, delta):
