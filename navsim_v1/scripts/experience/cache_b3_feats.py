@@ -92,6 +92,7 @@ with torch.no_grad():
                 yhat=out["y_hat"][i].cpu().numpy().astype(np.float16),
                 yt=yt[i].cpu().numpy().astype(np.float16),
                 sub=b["labels"][i].numpy().astype(np.float32),
+                outcomes=b["outcomes"][i].numpy().astype(np.float32),
                 b0=b["pdm_score"][i].numpy().astype(np.float32),
                 traj=b["proposals"][i].numpy().astype(np.float32),
                 key_src=key[i].astype(np.float16),

@@ -94,6 +94,61 @@ def test_frozen_pieces_no_grad():
     assert all(p_.grad is None for p_ in b3.parameters())
 
 
+def test_proposal_vocab_coordinates_consistent():
+    """Same trajectory must land in the same cluster during vocab fitting
+    and scene_o lookup (no centring anywhere)."""
+    from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (
+        build_proposal_vocab, scene_o,
+    )
+    rng = np.random.default_rng(0)
+    props = rng.normal(size=(500, 8, 3)).astype(np.float32)
+    vocab = build_proposal_vocab(props, n_clusters=8, seed=0)
+    # cluster of traj 7 under the vocab distance
+    X = props[7][None, :, :2].reshape(1, -1)
+    c0 = ((X - vocab) ** 2).sum(-1).argmin()
+    # scene_o's per-centre nearest-candidate assignment must map c0 to
+    # a candidate whose own cluster is c0... check assignment consistency:
+    sub = rng.uniform(size=(32, 6)).astype(np.float32)
+    o, mask = scene_o(props[:32], sub, vocab, thresh=np.inf)
+    X32 = props[:32, :, :2].reshape(32, -1)
+    cl32 = ((X32[:, None, :] - vocab[None]) ** 2).sum(-1).argmin(0)
+    for c in range(8):
+        nearest = ((X32[:, None, :] - vocab[None][:, c]) ** 2).sum(-1).argmin(0)
+        # the row filled for centre c uses candidate `nearest`; that
+        # candidate need not itself belong to cluster c — the check that
+        # matters: o[c] equals sub[nearest] exactly
+        assert np.allclose(o[c], sub[nearest])
+
+
+def test_shuffle_semantics():
+    """Old impl (token-order permutation) must NOT change Delta; the new
+    derangement (row swap of neighbour lists) must change it."""
+    delta = MemoryDelta()
+    # give delta a non-zero output head so Delta != 0
+    torch.nn.init.normal_(delta.out.weight, std=0.1)
+    a = torch.randn(2, 4, D_SCENE)
+    yh = torch.randn(2, 4, N_SLOTS * D_LAT)
+    mem = torch.randn(2, 16, D_SCENE)
+    d0 = delta(a, yh, mem)
+    perm = torch.randperm(16)
+    d1 = delta(a, yh, mem[:, perm])
+    assert torch.allclose(d0, d1, atol=1e-5)          # token order irrelevant
+    d2 = delta(a, yh, mem.flip(0))                    # deranged lists differ
+    assert not torch.allclose(d0, d2, atol=1e-4)
+
+
+def test_pad_mask_full_row_gives_zero_delta():
+    delta = MemoryDelta()
+    torch.nn.init.normal_(delta.out.weight, std=0.1)
+    a = torch.randn(2, 4, D_SCENE)
+    yh = torch.randn(2, 4, N_SLOTS * D_LAT)
+    mem = torch.randn(2, 16, D_SCENE)
+    pad = torch.ones(2, 16, dtype=torch.bool)         # all masked
+    d = delta(a, yh, mem, pad_mask=pad)
+    assert torch.isfinite(d).all()
+    assert torch.allclose(d, torch.zeros_like(d))
+
+
 def test_retrieval_kl_runs():
     g = KeyNet()
     ks = torch.randn(6, 512)

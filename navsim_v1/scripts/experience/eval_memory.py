@@ -6,12 +6,14 @@ Arms:
     lret        learned g retrieval + MemoryDelta (main method)
     appearance  appearance-cosine retrieval + MemoryDelta
     random      random scenes + MemoryDelta
-    shuffle     lret retrieval, memory tokens shuffled
-    scale{25,50}  lret with 25/50% of bank scenes (subsampled scenes)
-    (nolc arm = a separate run dir trained with --lam_c 0)
+    shuffle     lret retrieval, neighbour lists deranged across scenes
+    scale{25,50}  lret with 25/50% of bank scenes
 
-Scores per scene -> argmax -> chosen candidate's true final, stratified by
-all / conflict / rare10 / flip / tert0-2. Paired scene bootstrap 95% CI vs B0.
+Strata (same names as Step 3 eval): all / conflict / rare10 / flip / tert0-2
+    conflict = (outcomes[:,0] > 0).any() over candidates
+    flip     = arm's argmax pick != B0's pick, computed per arm
+    plus extra "b0_wrong" (B0 top1 final < best - 0.05)
+Paired scene bootstrap 95% CI vs B0.
 
     python scripts/experience/eval_memory.py \
         --query_cache $E/b3cache_navtest --bank_cache $E/b3cache_navtrain \
@@ -36,10 +38,10 @@ sys.path.insert(0, str(HERE))
 
 from train_ewm import LatentDataset, build_index  # noqa: E402
 from eval_ewm import KNN_Q, knn_mean_dist, scene_desc  # noqa: E402
-from train_memory import (CacheDataset, build_bank, collate_cache,  # noqa: E402
+from train_memory import (CacheDataset, build_bank,  # noqa: E402
                           eval_selection)
 from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (  # noqa: E402
-    KeyNet, MemoryDelta, MemTokenEnc, score_with_delta, make_memory_tokens)
+    KeyNet, MemoryDelta, MemTokenEnc)
 
 p = argparse.ArgumentParser()
 p.add_argument("--query_cache", required=True)
@@ -51,7 +53,8 @@ p.add_argument("--ref_labels_dir", required=True)
 p.add_argument("--ref_latents_dir", required=True)
 p.add_argument("--ref_tokens", required=True)
 p.add_argument("--run", required=True, help="memory run dir (model_best.pt)")
-p.add_argument("--arms", default="b0,lret,appearance,random,shuffle,scale25,scale50")
+p.add_argument("--arms",
+               default="b0,lret,appearance,random,shuffle,scale25,scale50")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--out_json", default=None)
 args = p.parse_args()
@@ -74,7 +77,7 @@ tokens = [l.strip() for l in open(args.tokens) if l.strip()]
 q_ds = CacheDataset(tokens, Path(args.query_cache))
 print(f"[eval] query scenes={len(q_ds)}", flush=True)
 
-bank_tokens = [f.stem for f in Path(args.bank_cache).glob("*/*.npz")]
+bank_tokens = [f.stem for f in Path(args.bank_cache).rglob("*.npz")]
 bank_ds = CacheDataset(bank_tokens, Path(args.bank_cache))
 bank = build_bank(bank_ds, keynet, device)
 print(f"[eval] bank scenes={len(bank.logs)}", flush=True)
@@ -96,19 +99,18 @@ q_desc = np.stack([scene_desc(q_lab[i]["outcomes"])
                    for i in range(len(q_lab))])
 q_desc = (q_desc - mu) / sd
 q_den = knn_mean_dist(q_desc, ref_desc, KNN_Q)
-tert = np.digitize(q_den, t_e)
-rare10 = q_den > d9
+tert_l = np.digitize(q_den, t_e)
+rare10_l = q_den > d9
 print("[eval] tertiles done", flush=True)
 
-# query order alignment: CacheDataset items sorted by path (log/token);
-# LatentDataset items sorted by token. Align by token index.
+# align tertiles (LatentDataset token order) to CacheDataset item order
 q_order = [p.stem for p in q_ds.items]
 lab_pos = {q_lab.items[i][0]: i for i in range(len(q_lab))}
 q_lab_idx = np.asarray([lab_pos[t] for t in q_order])
-tert = tert[q_lab_idx]
-rare10 = rare10[q_lab_idx]
+tert = tert_l[q_lab_idx]
+rare10 = rare10_l[q_lab_idx]
 
-# ---- run arms -----------------------------------------------------------------
+
 def boot_diff(a, b, n=2000, seed=0):
     rng = np.random.default_rng(seed)
     d = a - b
@@ -118,71 +120,84 @@ def boot_diff(a, b, n=2000, seed=0):
         float(np.percentile(m, 97.5))
 
 
-def strat_report(chosen_final, sub, logs, tert, rare10):
-    """per-scene metrics in 6 subsets; chosen_final (S,) true final of argmax."""
-    conf_scene = (sub[:, :, 0] < 1).any(1)
-    b0_pick = None  # filled by caller via flip mask later
-    rep = {}
-    for name, m in dict(all=np.ones(len(chosen_final), bool),
-                        conflict=conf_scene,
-                        rare10=rare10,
-                        tert0=tert == 0, tert1=tert == 1,
-                        tert2=tert == 2).items():
-        rep[name] = float(chosen_final[m].mean()) if m.any() else None
-    return rep
+def gather_query_arrays():
+    key, zp, a, yh, sub, b0, oc, logs = [], [], [], [], [], [], [], []
+    from torch.utils.data import DataLoader
+    from train_memory import collate_cache
+    for b in DataLoader(q_ds, batch_size=64, shuffle=False, num_workers=4,
+                        collate_fn=collate_cache):
+        key.append(b["key_src"].numpy()); zp.append(b["z_pool"].numpy())
+        a.append(b["a"].numpy()); yh.append(b["yhat"].numpy())
+        sub.append(b["sub"].numpy()); b0.append(b["b0"].numpy())
+        oc.append(b["outcomes"].numpy()); logs.extend(b["log_names"])
+    return (np.concatenate(key), np.concatenate(zp), np.concatenate(a),
+            np.concatenate(yh), np.concatenate(sub), np.concatenate(b0),
+            np.concatenate(oc), np.asarray(logs))
 
 
+key, zp, a, yh, sub, b0s, oc, logs = gather_query_arrays()
+conf_scene = (oc[:, :, 0] > 0).any(1)
+best = sub[..., 5].max(1)
+b0_pick = b0s.argmax(1)
+f_b0 = sub[np.arange(len(sub)), b0_pick]
+b0_wrong = f_b0 < best - 0.05
+
+
+def strat(f, pick):
+    m = dict(all=np.ones(len(f), bool), conflict=conf_scene,
+             rare10=rare10, flip=pick != b0_pick, b0_wrong=b0_wrong,
+             tert0=tert == 0, tert1=tert == 1, tert2=tert == 2)
+    return {k: float(f[v].mean()) if v.any() else None
+            for k, v in m.items()}, m
+
+
+# ---- B0 arm first: must reproduce Step-3 navtest numbers ----------------------
 out = {}
-f0, sub, b0s, logs = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                    device, key_mode="random")
-# b0 arm: chosen by pdm argmax
-f_b0 = sub[np.arange(len(sub)), b0s.argmax(1)]
-flip_mask = None
-results = {}
+rep_b0, _ = strat(f_b0, b0_pick)
+out["b0"] = rep_b0
+print(f"[eval] b0: all={rep_b0['all']:.4f} conflict={rep_b0['conflict']:.4f} "
+      f"rare10={rep_b0['rare10']:.4f} (expected ~.9354/.9337/.9025 on navtest)",
+      flush=True)
+print(f"[eval] b0_wrong scenes={int(b0_wrong.sum())}/{len(b0_wrong)}",
+      flush=True)
 
-arms = args.arms.split(",")
+# ---- learned arms --------------------------------------------------------------
+arms = [a for a in args.arms.split(",") if a != "b0"]
 for arm in arms:
-    if arm == "b0":
-        f = f_b0
-    elif arm == "lret":
-        f, _, _, _ = eval_selection(bank, keynet, memenc, delta, q_ds, device,
-                                    key_mode="lret")
+    if arm == "lret":
+        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
+                                            device, key_mode="lret")
     elif arm == "appearance":
-        f, _, _, _ = eval_selection(bank, keynet, memenc, delta, q_ds, device,
-                                    key_mode="appearance")
+        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
+                                            device, key_mode="appearance")
     elif arm == "random":
-        f = f0
+        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
+                                            device, key_mode="random")
     elif arm == "shuffle":
-        f, _, _, _ = eval_selection(bank, keynet, memenc, delta, q_ds, device,
-                                    key_mode="lret", shuffle=True)
+        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
+                                            device, key_mode="lret",
+                                            shuffle=True)
     elif arm.startswith("scale"):
-        f, _, _, _ = eval_selection(bank, keynet, memenc, delta, q_ds, device,
-                                    key_mode="lret",
-                                    scale=int(arm[5:]) / 100, seed=args.seed)
+        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
+                                            device, key_mode="lret",
+                                            scale=int(arm[5:]) / 100,
+                                            seed=args.seed)
     else:
         continue
-    results[arm] = f
-    rep = strat_report(f, sub, logs, tert, rare10)
+    rep, masks = strat(f, pk)
+    m_all, lo_all, hi_all = boot_diff(f, f_b0)
     out[arm] = rep
-    print(f"[eval] {arm}: all={rep['all']:.4f} conflict={rep['conflict']:.4f} "
-          f"rare10={rep['rare10']:.4f}", flush=True)
+    out[arm]["vs_b0_all"] = dict(mean=m_all, lo=lo_all, hi=hi_all)
+    for s_name in ("conflict", "rare10", "b0_wrong", "flip"):
+        mm = masks[s_name]
+        m2, lo2, hi2 = boot_diff(f[mm], f_b0[mm])
+        out[arm][f"vs_b0_{s_name}"] = dict(mean=m2, lo=lo2, hi=hi2)
+    out[arm]["delta_mean"] = float(dl.mean())
+    out[arm]["delta_big_frac"] = float((np.abs(dl) > 0.1).mean())
+    print(f"[eval] {arm}: all={rep['all']:.4f} ({m_all:+.4f} "
+          f"[{lo_all:+.4f},{hi_all:+.4f}]) conflict={rep['conflict']:.4f} "
+          f"rare10={rep['rare10']:.4f} flip={rep['flip']} "
+          f"|d|>.1:{out[arm]['delta_big_frac']:.3f}", flush=True)
 
-# flip: scenes where b0 picked wrong (>0.05 below best)
-best = sub[..., 5].max(1)
-f_b0_final = f_b0
-flip = sub[np.arange(len(sub)), b0s.argmax(1)] < best - 0.05
-for arm, f in results.items():
-    out[arm]["flip"] = float(f[flip].mean()) if flip.any() else None
-    m, lo, hi = boot_diff(f, f_b0_final)
-    out[arm]["vs_b0"] = dict(mean=m, lo=lo, hi=hi)
-    for sub_name, msk in dict(all=np.ones(len(f), bool),
-                              rare10=rare10, flip=flip,
-                              conflict=(sub[:, :, 0] < 1).any(1)).items():
-        m2, lo2, hi2 = boot_diff(f[msk], f_b0_final[msk])
-        out[arm][f"vs_b0_{sub_name}"] = dict(mean=m2, lo=lo2, hi=hi2)
-    print(f"[eval] {arm} vs b0: all {m:+.4f} [{lo:+.4f},{hi:+.4f}] "
-          f"flip={out[arm]['flip']}", flush=True)
-
-print(f"[eval] flip scenes={int(flip.sum())}/{len(flip)}", flush=True)
 if args.out_json:
     Path(args.out_json).write_text(json.dumps(out, indent=1))

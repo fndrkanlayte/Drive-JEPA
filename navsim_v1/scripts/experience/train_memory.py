@@ -43,6 +43,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (  #
     MemoryBank,
     MemoryDelta,
     MemTokenEnc,
+    derange,
     listwise_ce,
     make_memory_tokens,
     pairwise_hinge,
@@ -62,13 +63,8 @@ class CacheDataset(Dataset):
 
     def __init__(self, tokens, cache_dir: Path, labels_dir: Path = None,
                  lat_index: dict = None):
-        self.items = []
-        cache_dir = Path(cache_dir)
-        for t in tokens:
-            for lp in cache_dir.glob(f"*/{t}.npz"):
-                self.items.append(lp)
-        # fall back to recursive scan result order; sort for determinism
-        self.items.sort()
+        index = {p.stem: p for p in Path(cache_dir).rglob("*.npz")}
+        self.items = sorted(index[t] for t in tokens if t in index)
 
     def __len__(self):
         return len(self.items)
@@ -118,8 +114,10 @@ def selection_final(scores: np.ndarray, final: np.ndarray) -> float:
 
 def eval_selection(bank, keynet, memenc, delta, ds, device,
                    key_mode="lret", shuffle=False, scale=1.0, seed=0):
-    """Vectorised selection eval on a CacheDataset; returns per-scene
-    (final_chosen, labels, conflict scenes idx arrays for subsets)."""
+    """Vectorised selection eval on a CacheDataset.
+    Returns (chosen_final, picks, sub, b0, logs, delta_flat):
+    chosen_final (S,), picks (S,) argmax candidate idx, sub (S,K,6),
+    b0 (S,K), logs (S,), delta_flat (S,K) raw Delta values."""
     keynet.eval(); memenc.eval(); delta.eval()
     key, zp, a, yh, sub, b0, logs = [], [], [], [], [], [], []
     for b in DataLoader(ds, batch_size=64, shuffle=False, num_workers=4,
@@ -159,31 +157,34 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
     else:
         raise ValueError(key_mode)
 
+    if shuffle:
+        nb = derange(nb)            # every scene gets another scene's list
+
     g = bank.gather(nb)
     B, kk, K = g["sub"].shape[:3]
-    finals = np.zeros((B, K), np.float32)
+    finals = np.zeros(B, np.float32)
+    picks = np.zeros(B, np.int64)
+    dflat = np.zeros((B, K), np.float32)
     chunk = 128
     with torch.no_grad():
         for s in range(0, B, chunk):
             sl = slice(s, min(s + chunk, B))
             gs = {k: v[sl] for k, v in g.items()}
             mem = make_memory_tokens(memenc, gs, device)
-            if shuffle:
-                perm = torch.randperm(mem.shape[1], device=device)
-                mem = mem[:, perm]
-            # mask invalid scenes' tokens
-            valid = torch.from_numpy(gs["valid"]).to(device).float()
-            valid = valid[:, :, None].expand(-1, -1, K).reshape(
-                valid.shape[0], -1, 1)
-            mem = mem * valid
+            # pad mask: invalid (missing) neighbour scenes
+            valid = torch.from_numpy(gs["valid"]).to(device)
+            pad = ~valid[:, :, None].expand(-1, -1, K).reshape(
+                valid.shape[0], -1)
             at = torch.from_numpy(a[sl]).to(device)
             yf = torch.from_numpy(yh[sl]).to(device).reshape(
                 at.shape[0], at.shape[1], -1)
-            dl = delta(at, yf, mem)
+            dl = delta(at, yf, mem, pad_mask=pad)
+            dflat[sl] = dl.cpu().numpy()
             sc = score_with_delta(torch.from_numpy(b0[sl]).to(device), dl)
+            picks[sl] = sc.argmax(1).cpu().numpy()
             finals[sl] = torch.from_numpy(sub[sl])[
-                torch.arange(len(sc)), sc.argmax(1)].numpy()
-    return finals, sub, b0, logs
+                torch.arange(len(sc)), picks[sl]].numpy()
+    return finals, picks, sub, b0, logs, dflat
 
 
 def main():
@@ -224,8 +225,9 @@ def main():
     val_ds = CacheDataset(val_tokens, cache)
     print(f"[mem] train={len(train_ds)} val={len(val_ds)}", flush=True)
 
-    # bank = everything in cache dir (navtrain all), matching spec
-    bank_ds = CacheDataset([t for t in train_tokens + val_tokens], cache)
+    # bank for train/val = train split ONLY (val consequences must not
+    # leak into memory); navtest eval builds its own full-navtrain bank
+    bank_ds = CacheDataset(train_tokens, cache)
     keynet = KeyNet().to(device)
     memenc = MemTokenEnc().to(device)
     delta = MemoryDelta().to(device)
@@ -285,18 +287,15 @@ def main():
                 nb_s = bank.stage2(qg, cand, q_logs, k=args.k)
                 g = bank.gather(nb_s)
                 mem = make_memory_tokens(memenc, g, device)
-                valid = torch.from_numpy(g["valid"]).to(device).float()
+                valid = torch.from_numpy(g["valid"]).to(device)
                 Kq = b["sub"].shape[1]
-                valid = valid[:, :, None].expand(-1, -1, Kq).reshape(
-                    B, -1, 1)
-                # memory dropout p=0.2
-                drop = (torch.rand(mem.shape[:2], device=device) > P_DROP
-                        ).float().unsqueeze(-1)
-                mem = mem * drop * valid
+                pad = ~valid[:, :, None].expand(-1, -1, Kq).reshape(B, -1)
+                # memory dropout p=0.2 as extra pad-mask entries
+                pad = pad | (torch.rand(pad.shape, device=device) < P_DROP)
 
                 at = b["a"].to(device)
                 yf = b["yhat"].to(device).flatten(2)
-                dl = delta(at, yf, mem)
+                dl = delta(at, yf, mem, pad_mask=pad)
                 scores = score_with_delta(b["b0"].to(device), dl)
                 final = b["sub"][..., 5].to(device)
 
@@ -312,13 +311,13 @@ def main():
                 lhinge = pairwise_hinge(scores, final, weight=hw)
                 lmain = lce + args.lam_hinge * lhinge
 
-                # memory-dependence constraint: random-swap neighbours
+                # memory-dependence constraint: deranged neighbours
+                # (same 'wrong memory' semantics as eval shuffle arm)
                 if args.lam_c > 0:
-                    nb_shuf = bank.retrieve_random(q_logs, k=args.k,
-                                                   seed=np.random.randint(1e9))
+                    nb_shuf = derange(nb_s)
                     gs = bank.gather(nb_shuf)
                     mem_s = make_memory_tokens(memenc, gs, device)
-                    dl_s = delta(at, yf, mem_s)
+                    dl_s = delta(at, yf, mem_s, pad_mask=pad)
                     sc_s = score_with_delta(b["b0"].to(device), dl_s)
                     l_s = listwise_ce(sc_s, final, weight=hw)
                     lc = F.relu(MU - (l_s - lce))
@@ -332,15 +331,30 @@ def main():
             ep_c += float(lc); ep_main += float(lce)
             nb += 1
 
-        # ---- val: selection final ------------------------------------------
-        vf, sub, b0v, _ = eval_selection(bank, keynet, memenc, delta,
-                                         val_ds, device)
+        # ---- val: selection final (lret / shuffle / b0) + Delta stats ------
+        vf, picks, sub, b0v, _, dflat = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device)
+        vf_s, _, _, _, _, _ = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device, shuffle=True)
+        vf_b0 = sub[np.arange(len(sub)), b0v.argmax(1)]
+        n_hard = int((sub[np.arange(len(sub)), b0v.argmax(1)] <
+                      sub[..., 5].max(1) - 0.05).sum())
         rec = dict(epoch=ep, loss=ep_loss / nb, lret=ep_ret / nb,
                    lmain=ep_main / nb, lc=ep_c / nb,
-                   val_final=vf.mean(), secs=round(time.time() - t0, 1))
+                   val_final=float(vf.mean()),
+                   val_final_shuffle=float(vf_s.mean()),
+                   val_final_b0=float(vf_b0.mean()),
+                   delta_mean=float(dflat.mean()),
+                   delta_std=float(dflat.std()),
+                   delta_big=float((np.abs(dflat) > 0.1).mean()),
+                   n_hard_scenes=n_hard,
+                   secs=round(time.time() - t0, 1))
         hist.append(rec)
         print(f"[mem] ep{ep} loss={rec['loss']:.4f} lret={rec['lret']:.4f} "
-              f"lc={rec['lc']:.4f} val_final={rec['val_final']:.4f} "
+              f"lc={rec['lc']:.4f} val={rec['val_final']:.4f} "
+              f"shuf={rec['val_final_shuffle']:.4f} "
+              f"b0={rec['val_final_b0']:.4f} "
+              f"d={rec['delta_mean']:+.4f}/|d|>.1:{rec['delta_big']:.3f} "
               f"({rec['secs']}s)", flush=True)
         ck = dict(args=vars(args), keynet=keynet.state_dict(),
                   memenc=memenc.state_dict(), delta=delta.state_dict(),

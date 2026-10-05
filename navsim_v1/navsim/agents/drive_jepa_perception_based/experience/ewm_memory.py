@@ -104,13 +104,24 @@ class MemoryDelta(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, a: torch.Tensor, yhat_flat: torch.Tensor,
-                mem: torch.Tensor) -> torch.Tensor:
-        """a (B,K,256); yhat_flat (B,K,320); mem (B,M,256) -> Delta (B,K)."""
+                mem: torch.Tensor,
+                pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """a (B,K,256); yhat_flat (B,K,320); mem (B,M,256);
+        pad_mask (B,M) bool, True = ignore that memory token.
+        Rows whose memory is fully masked get Delta = 0."""
         h = self.q_proj(torch.cat([a, yhat_flat], dim=-1))
+        fully = None
+        if pad_mask is not None:
+            pad_mask = pad_mask.clone()
+            fully = pad_mask.all(1)
+            pad_mask[fully, 0] = False        # keep one token to avoid NaN
         for attn, norm in zip(self.attn, self.norm):
-            ctx, _ = attn(h, mem, mem)
+            ctx, _ = attn(h, mem, mem, key_padding_mask=pad_mask)
             h = norm(h + ctx)
-        return self.out(h).squeeze(-1)
+        d = self.out(h).squeeze(-1)
+        if fully is not None:
+            d = d * (~fully).float().unsqueeze(-1)
+        return d
 
 
 def score_with_delta(b0: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -299,10 +310,10 @@ def make_memory_tokens(enc: MemTokenEnc, gathered: Dict[str, np.ndarray],
 
 def build_proposal_vocab(proposals: np.ndarray, n_clusters: int = 64,
                          seed: int = 0, iters: int = 50) -> np.ndarray:
-    """k-means over flattened proposal poses (x,y) -> (n_clusters,16)."""
+    """k-means over flattened proposal poses (x,y) -> (n_clusters,16).
+    Proposals are already in ego frame: no centring anywhere."""
     X = np.asarray(proposals[:, :, :2], dtype=np.float32).reshape(
         len(proposals), -1)
-    X = X - X.mean(0, keepdims=True)
     rng = np.random.default_rng(seed)
     ctr = X[rng.choice(len(X), n_clusters, replace=False)].copy()
     for _ in range(iters):
@@ -321,10 +332,17 @@ def scene_o(proposals: np.ndarray, sub: np.ndarray,
     For each cluster centre c, fill subscores of the scene candidate nearest
     to c; mask the row if that distance exceeds `thresh`."""
     X = proposals[:, :, :2].reshape(len(proposals), -1)
-    Xc = X - X.mean(0, keepdims=True)
-    d = ((Xc[:, None, :] - vocab[None]) ** 2).sum(-1)    # (K,C)
+    d = ((X[:, None, :] - vocab[None]) ** 2).sum(-1)    # (K,C)
     nn_idx = d.argmin(0)                                # (C,)
     nn_d = np.sqrt(d[nn_idx, np.arange(len(vocab))])
     o = sub[nn_idx]                                     # (C,6)
     mask = nn_d <= thresh
     return o, mask
+
+
+def derange(idx2d: np.ndarray) -> np.ndarray:
+    """Derange rows of a (B,k) neighbour-index array: every query gets
+    another query's neighbour list (roll by 1 along the batch axis)."""
+    if len(idx2d) < 2:
+        return idx2d
+    return np.roll(idx2d, 1, axis=0)
