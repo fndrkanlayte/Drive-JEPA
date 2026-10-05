@@ -38,6 +38,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm import EWMJEPA  # 
 
 from train_ewm import (  # noqa: E402
     LatentDataset,
+    build_model,
     auprc,
     build_index,
     collate,
@@ -51,11 +52,14 @@ KNN_Q = 20
 def load_model(run_dir: Path, device):
     ckpt = torch.load(Path(run_dir) / "model.pt", map_location="cpu",
                       weights_only=False)
-    direct = ckpt["args"]["model"] == "b1"
-    model = EWMJEPA(n_layers=ckpt["args"]["n_layers"], direct=direct).to(device)
+    name = ckpt["args"]["model"]
+    direct = name in ("b1", "b1aux")
+    model = build_model(name, ckpt["args"]["n_layers"],
+                        use_future=ckpt["args"].get("use_future", False)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model, direct, ckpt["args"].get("model", "?")
+    # tag by run dir so several seeds of one arm do not overwrite each other
+    return model, direct, f"{name}:{Path(run_dir).name}"
 
 
 @torch.no_grad()
@@ -67,7 +71,7 @@ def infer(model, loader, device, direct):
         pf = b["proposal_feature"].to(device)
         tr = b["proposals"].to(device)
         out = model(img, pf, tr)
-        logits = out["logits"] if direct else out["readout"]
+        logits = out["logits"] if "logits" in out else out["readout"]
         probs = torch.sigmoid(logits).cpu().numpy()
         labels = b["labels"].numpy()
         outs = b["outcomes"].numpy()
@@ -249,7 +253,7 @@ def main() -> None:
                 return {}
             lab_sel = labels[idx, sel[idx]]              # (n,6)
             out = {}
-            for j, nm in enumerate(["NC", "DAC", "TTC", "EP", "C", "final"]):
+            for j, nm in enumerate(["NC", "DAC", "EP", "TTC", "C", "final"]):
                 lo, hi = bootstrap_ci(lab_sel[:, j])
                 out[nm] = dict(mean=float(lab_sel[:, j].mean()), ci=[lo, hi])
             return out
