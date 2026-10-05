@@ -49,8 +49,8 @@ TIMING_IDX = np.array([DESCRIPTOR_FIELD_INDEX[f] for f in TIMING_FIELDS])
 KNN_Q = 20
 
 
-def load_model(run_dir: Path, device):
-    ckpt = torch.load(Path(run_dir) / "model.pt", map_location="cpu",
+def load_model(run_dir: Path, device, ckpt_name: str = "model.pt"):
+    ckpt = torch.load(Path(run_dir) / ckpt_name, map_location="cpu",
                       weights_only=False)
     name = ckpt["args"]["model"]
     direct = name in ("b1", "b1aux")
@@ -166,6 +166,7 @@ def main() -> None:
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--out_json", default=None)
+    p.add_argument("--ckpt", default="model.pt", help="model.pt (last epoch) or model_best.pt (val-selected)")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,7 +214,7 @@ def main() -> None:
     # ---- per-run inference + metrics ---------------------------------------
     report = {}
     for run in args.runs.split(","):
-        model, direct, tag = load_model(Path(run), device)
+        model, direct, tag = load_model(Path(run), device, args.ckpt)
         rows = infer(model, loader, device, direct)
 
         probs = np.stack([r["probs"] for r in rows])      # (S,K,6)

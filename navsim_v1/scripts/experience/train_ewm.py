@@ -245,6 +245,8 @@ def main() -> None:
     p.add_argument("--lam_fut", type=float, default=0.5)
     p.add_argument("--lam_aux", type=float, default=0.5)
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--select_metric", default="nc_ttc_spm",
+                   help="val criterion for model_best.pt: mean of nc_auprc, ttc_auprc, spearman_final")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -287,6 +289,8 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     history = []
+    best_sel, best_epoch = -float("inf"), -1
+    ckpt_args = {**vars(args), "use_future": fmap is not None}
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -334,11 +338,18 @@ def main() -> None:
         metrics = evaluate(model, val_loader, device, direct=(args.model in ("b1", "b1aux")))
         row = {"epoch": epoch, "secs": round(time.time() - t0, 1),
                **{k: round(v / nb, 4) for k, v in losses.items()}, **metrics}
+        sel = float(np.nanmean([metrics["nc_auprc"], metrics["ttc_auprc"], metrics["spearman_final"]]))
+        row["select"] = round(sel, 4)
         history.append(row)
         print(f"[train] {row}", flush=True)
+        if sel > best_sel:
+            best_sel, best_epoch = sel, epoch
+            torch.save({"model": model.state_dict(), "args": ckpt_args, "epoch": epoch},
+                       out_dir / "model_best.pt")
 
-    torch.save({"model": model.state_dict(), "args": {**vars(args), "use_future": fmap is not None}},
+    torch.save({"model": model.state_dict(), "args": ckpt_args, "epoch": args.epochs - 1},
                out_dir / "model.pt")
+    print(f"[train] best epoch {best_epoch} select={best_sel:.4f}", flush=True)
     (out_dir / "history.json").write_text(json.dumps(history, indent=1))
     print(f"[train] saved {out_dir}/model.pt")
 
