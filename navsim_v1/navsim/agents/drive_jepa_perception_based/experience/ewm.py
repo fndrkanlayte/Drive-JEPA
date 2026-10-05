@@ -124,12 +124,18 @@ class Readout(nn.Module):
 
 
 class EWMJEPA(nn.Module):
-    """B2 EWM model (and B1 when ``direct=True``): shared encoders + trunk."""
+    """B2 EWM model (and B1 when ``direct=True``): shared encoders + trunk.
+
+    ``aux=True`` (B1+aux arm) adds an auxiliary head on the same trunk
+    features ``a`` predicting the 12 noatt TIMING_FIELDS (aux losses are
+    applied by the trainer, with censoring-flag masks)."""
 
     def __init__(self, n_layers: int = 3, d_model: int = D_SCENE,
-                 d_latent: int = D_LATENT, direct: bool = False) -> None:
+                 d_latent: int = D_LATENT, direct: bool = False,
+                 aux: bool = False) -> None:
         super().__init__()
         self.direct = direct
+        self.aux = aux
         self.scene = SceneEncoder(d_model)
         self.action = ActionEncoder(d_model)
         self.layers = nn.ModuleList(
@@ -142,6 +148,10 @@ class EWMJEPA(nn.Module):
         else:
             self.y_head = nn.Linear(d_model, d_latent)
             self.readout = Readout(d_latent)
+        if aux:
+            self.aux_head = nn.Sequential(
+                nn.Linear(d_model, 128), nn.GELU(), nn.Linear(128, 12),
+            )
         self.outcome = OutcomeEncoder()          # E_y
         self.outcome_ema = OutcomeEncoder()      # EMA copy
         for p in self.outcome_ema.parameters():
@@ -167,10 +177,16 @@ class EWMJEPA(nn.Module):
     def forward(self, image_feature: torch.Tensor, proposal_feature: torch.Tensor,
                 trajectories: torch.Tensor) -> Dict[str, torch.Tensor]:
         a, z = self.forward_trunk(image_feature, proposal_feature, trajectories)
+        out = {}
         if self.direct:
-            return {"logits": self.head(a)}
-        y_hat = self.y_head(a)                    # (B, K, 64)
-        return {"y_hat": y_hat, "readout": self.readout(y_hat)}
+            out["logits"] = self.head(a)
+        else:
+            y_hat = self.y_head(a)                    # (B, K, 64)
+            out["y_hat"] = y_hat
+            out["readout"] = self.readout(y_hat)
+        if self.aux:
+            out["aux"] = self.aux_head(a)             # (B, K, 12)
+        return out
 
 
 def vicreg_var_cov(y: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
