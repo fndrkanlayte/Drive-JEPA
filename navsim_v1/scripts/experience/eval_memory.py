@@ -62,11 +62,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ckpt = torch.load(Path(args.run) / "model_best.pt", map_location="cpu",
                   weights_only=False)
-no_latent = bool(ckpt.get("args", {}).get("no_latent", False))
+ck_args = ckpt.get("args", {})
+no_latent = bool(ck_args.get("no_latent", False))
+readout = ck_args.get("readout", "resid")
 keynet = KeyNet().to(device); keynet.load_state_dict(ckpt["keynet"])
 memenc = MemTokenEnc(no_latent=no_latent).to(device)
 memenc.load_state_dict(ckpt["memenc"])
-delta = MemoryDelta(no_latent=no_latent).to(device)
+delta = MemoryDelta(no_latent=no_latent, readout=readout).to(device)
 delta.load_state_dict(ckpt["delta"])
 keynet.eval(); memenc.eval(); delta.eval()
 for m in (keynet, memenc, delta):
@@ -166,6 +168,7 @@ print(f"[eval] b0_wrong scenes={int(b0_wrong.sum())}/{len(b0_wrong)}",
 
 # ---- learned arms --------------------------------------------------------------
 arms = [a for a in args.arms.split(",") if a != "b0"]
+dflat_lret = None
 for arm in arms:
     if arm == "lret":
         f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
@@ -197,6 +200,13 @@ for arm in arms:
         out[arm][f"vs_b0_{s_name}"] = dict(mean=m2, lo=lo2, hi=hi2)
     out[arm]["delta_mean"] = float(dl.mean())
     out[arm]["delta_big_frac"] = float((np.abs(dl) > 0.1).mean())
+    out[arm]["dstd"] = float(
+        (dl - dl.mean(1, keepdims=True)).std(1).mean())
+    out[arm]["flip_rate"] = float((pk != b0_pick).mean())
+    if arm == "lret":
+        dflat_lret = dl
+    if arm == "shuffle" and dflat_lret is not None:
+        out[arm]["dgap_vs_lret"] = float(np.abs(dl - dflat_lret).mean())
     print(f"[eval] {arm}: all={rep['all']:.4f} ({m_all:+.4f} "
           f"[{lo_all:+.4f},{hi_all:+.4f}]) conflict={rep['conflict']:.4f} "
           f"rare10={rep['rare10']:.4f} flip={rep['flip']} "

@@ -99,12 +99,16 @@ class MemTokenEnc(nn.Module):
 class MemoryDelta(nn.Module):
     """h_k = [a_k(256), y_hat_k flat(320)] -> q_proj; 2 XAttn layers over
     k*32 memory tokens -> scalar Delta_k (zero-init output head).
-    no_latent=True queries with a_k alone (yhat ignored)."""
+    no_latent=True queries with a_k alone (yhat ignored).
+    readout="resid": h accumulates residual ctx (baseline residual scorer).
+    readout="mem":   layer-1 ctx1 = attn(h, mem, mem); layer-2 queries
+                     norm(h+ctx1) but Delta = out(ctx2) — memory content only."""
 
     def __init__(self, d: int = D_SCENE, n_heads: int = 4,
-                 no_latent: bool = False):
+                 no_latent: bool = False, readout: str = "resid"):
         super().__init__()
         self.no_latent = no_latent
+        self.readout = readout
         self.q_proj = nn.Linear(D_SCENE + (0 if no_latent else N_SLOTS * D_LAT),
                                 d)
         self.attn = nn.ModuleList(
@@ -130,10 +134,20 @@ class MemoryDelta(nn.Module):
             pad_mask = pad_mask.clone()
             fully = pad_mask.all(1)
             pad_mask[fully, 0] = False        # keep one token to avoid NaN
-        for attn, norm in zip(self.attn, self.norm):
-            ctx, _ = attn(h, mem, mem, key_padding_mask=pad_mask)
-            h = norm(h + ctx)
-        d = self.out(h).squeeze(-1)
+        if self.readout == "mem":
+            # Delta reads ONLY attention-retrieved memory content;
+            # h enters the second pass only as the attention query
+            ctx1, _ = self.attn[0](h, mem, mem,
+                                   key_padding_mask=pad_mask)
+            q2 = self.norm[0](h + ctx1)
+            ctx2, _ = self.attn[1](q2, mem, mem,
+                                   key_padding_mask=pad_mask)
+            d = self.out(ctx2).squeeze(-1)
+        else:
+            for attn, norm in zip(self.attn, self.norm):
+                ctx, _ = attn(h, mem, mem, key_padding_mask=pad_mask)
+                h = norm(h + ctx)
+            d = self.out(h).squeeze(-1)
         if fully is not None:
             d = d * (~fully).float().unsqueeze(-1)
         return d

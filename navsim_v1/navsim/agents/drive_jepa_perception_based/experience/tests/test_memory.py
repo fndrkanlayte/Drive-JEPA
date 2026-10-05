@@ -180,6 +180,23 @@ def test_no_latent_flag_shapes_and_zero_init():
     assert (sc.argmax(1) == b0v[:, 0].argmax(1)).all()
 
 
+def test_mem_readout_depends_on_memory():
+    """readout='mem': Delta is built only from read memory content —
+    different memory -> different Delta; empty (all-pad) memory -> 0."""
+    delta = MemoryDelta(readout="mem")
+    torch.nn.init.normal_(delta.out.weight, std=0.1)
+    a = torch.randn(2, 4, D_SCENE)
+    yh = torch.randn(2, 4, N_SLOTS * D_LAT)
+    mem1 = torch.randn(2, 16, D_SCENE)
+    mem2 = torch.randn(2, 16, D_SCENE)
+    d1 = delta(a, yh, mem1)
+    d2 = delta(a, yh, mem2)
+    assert not torch.allclose(d1, d2, atol=1e-4)      # memory matters
+    pad = torch.ones(2, 16, dtype=torch.bool)
+    d0 = delta(a, yh, mem1, pad_mask=pad)
+    assert torch.allclose(d0, torch.zeros_like(d0))   # empty memory -> 0
+
+
 def test_pad_mask_full_row_gives_zero_delta():
     delta = MemoryDelta()
     torch.nn.init.normal_(delta.out.weight, std=0.1)

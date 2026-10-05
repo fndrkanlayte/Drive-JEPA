@@ -28,8 +28,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.multiprocessing
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+# fd-passing storage exhausts the 1024-fd limit on shared clusters;
+# use file_system sharing for dataloader workers
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
@@ -213,6 +218,9 @@ def main():
     p.add_argument("--no_latent", action="store_true",
                    help="ablation: drop yhat/y_t from memory tokens and "
                         "query head (appearance+traj+scores only)")
+    p.add_argument("--readout", choices=["resid", "mem"], default="mem",
+                   help="resid: h+ctx residual readout (baseline); "
+                        "mem: Delta from attention-read memory only")
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--out_dir", required=True)
     args = p.parse_args()
@@ -238,7 +246,8 @@ def main():
     bank_ds = CacheDataset(train_tokens, cache)
     keynet = KeyNet().to(device)
     memenc = MemTokenEnc(no_latent=args.no_latent).to(device)
-    delta = MemoryDelta(no_latent=args.no_latent).to(device)
+    delta = MemoryDelta(no_latent=args.no_latent,
+                        readout=args.readout).to(device)
     if args.key_ckpt:
         keynet.load_state_dict(torch.load(args.key_ckpt, map_location="cpu"))
         print(f"[mem] loaded key_ckpt {args.key_ckpt}", flush=True)
@@ -346,27 +355,34 @@ def main():
         # ---- val: selection final (lret / shuffle / b0) + Delta stats ------
         vf, picks, sub, b0v, _, dflat = eval_selection(
             bank, keynet, memenc, delta, val_ds, device)
-        vf_s, _, _, _, _, _ = eval_selection(
+        vf_s, _, _, _, _, dflat_s = eval_selection(
             bank, keynet, memenc, delta, val_ds, device, shuffle=True)
         sub_f = sub[..., 5]
         vf_b0 = sub_f[np.arange(len(sub)), b0v.argmax(1)]
         n_hard = int((vf_b0 < sub_f.max(1) - 0.05).sum())
+        # memory-usage diagnostics
+        dstd = float((dflat - dflat.mean(1, keepdims=True)).std(1).mean())
+        flip = float((picks != b0v.argmax(1)).mean())
+        dgap = float(np.abs(dflat - dflat_s).mean())
         rec = dict(epoch=ep, loss=ep_loss / nb, lret=ep_ret / nb,
                    lmain=ep_main / nb, lc=ep_c / nb,
                    val_final=float(vf.mean()),
                    val_final_shuffle=float(vf_s.mean()),
+                   val_minus_shuf=float(vf.mean() - vf_s.mean()),
                    val_final_b0=float(vf_b0.mean()),
                    delta_mean=float(dflat.mean()),
                    delta_std=float(dflat.std()),
                    delta_big=float((np.abs(dflat) > 0.1).mean()),
+                   dstd=dstd, flip=flip, dgap=dgap,
                    n_hard_scenes=n_hard,
                    secs=round(time.time() - t0, 1))
         hist.append(rec)
         print(f"[mem] ep{ep} loss={rec['loss']:.4f} lret={rec['lret']:.4f} "
               f"lc={rec['lc']:.4f} val={rec['val_final']:.4f} "
               f"shuf={rec['val_final_shuffle']:.4f} "
+              f"({rec['val_minus_shuf']:+.4f}) "
               f"b0={rec['val_final_b0']:.4f} "
-              f"d={rec['delta_mean']:+.4f}/|d|>.1:{rec['delta_big']:.3f} "
+              f"dstd={dstd:.4f} flip={flip:.3f} dgap={dgap:.4f} "
               f"({rec['secs']}s)", flush=True)
         ck = dict(args=vars(args), keynet=keynet.state_dict(),
                   memenc=memenc.state_dict(), delta=delta.state_dict(),
