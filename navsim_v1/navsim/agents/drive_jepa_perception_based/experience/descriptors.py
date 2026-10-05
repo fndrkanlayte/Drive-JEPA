@@ -41,6 +41,16 @@ ITYPE_NAMES = {
 SAME_DIR_THRESH_RAD = np.deg2rad(30.0)
 ONCOMING_THRESH_RAD = np.deg2rad(150.0)
 
+# tracked-agent class codes (stored as float in the descriptor array)
+ACLASS_VEHICLE = 0
+ACLASS_PEDESTRIAN = 1
+ACLASS_BICYCLE = 2
+ACLASS_NAMES = {
+    ACLASS_VEHICLE: "VEHICLE",
+    ACLASS_PEDESTRIAN: "PEDESTRIAN",
+    ACLASS_BICYCLE: "BICYCLE",
+}
+
 # Field order of the descriptor array written by label_candidates.py.
 # Every field is float32; boolean flags are stored as 0.0/1.0.
 DESCRIPTOR_FIELDS: List[str] = [
@@ -69,6 +79,16 @@ DESCRIPTOR_FIELDS: List[str] = [
     "rel_y",              # lateral offset of j center wrt ego [m]
     "rel_heading",        # wrap_to_pi(j_heading - ego_heading) [rad]
     "speed",              # |v_j| at t=0 [m/s]
+]
+
+# Extended field order for the multi-class (vehicle/pedestrian/bicycle)
+# descriptor array written by label_candidates.py --include_vru: same fields
+# plus agent class and the `emerging` flag (agent absent at t=0, present and
+# conflicting later). DESCRIPTOR_FIELDS itself is unchanged so existing
+# vehicle-only npz and feature layouts stay backward compatible.
+DESCRIPTOR_FIELDS_EXT: List[str] = DESCRIPTOR_FIELDS + [
+    "agent_class",        # ACLASS_* code
+    "emerging",           # absent at t=0, present later AND conflicting
 ]
 
 DESCRIPTOR_FIELD_INDEX: Dict[str, int] = {f: i for i, f in enumerate(DESCRIPTOR_FIELDS)}
@@ -144,6 +164,7 @@ def compute_interaction_descriptor(
     dt: float = 0.1,
     att_collision: bool = False,
     att_ttc: bool = False,
+    agent_class: float = ACLASS_VEHICLE,
 ) -> Dict[str, float]:
     """Compute the ego-vehicle interaction descriptor for one (candidate, vehicle) pair.
 
@@ -160,9 +181,10 @@ def compute_interaction_descriptor(
     num_steps = len(ego_polys)
     assert len(j_polys) == num_steps
 
-    desc: Dict[str, float] = {f: np.nan for f in DESCRIPTOR_FIELDS}
+    desc: Dict[str, float] = {f: np.nan for f in DESCRIPTOR_FIELDS_EXT}
     desc["att_collision"] = float(att_collision)
     desc["att_ttc"] = float(att_ttc)
+    desc["agent_class"] = float(agent_class)
 
     # ---------------- swept volumes ----------------
     present_j = [p for p in j_polys if p is not None]
@@ -182,6 +204,7 @@ def compute_interaction_descriptor(
 
     conflict = bool(ego_occ.any() and j_occ.any())
     desc["conflict"] = float(conflict)
+    desc["emerging"] = float(j_polys[0] is None and conflict)
 
     # ---------------- occupancy intervals ----------------
     t = np.arange(num_steps, dtype=np.float64) * dt

@@ -246,8 +246,11 @@ class TestFeatureVector:
         assert np.isnan(v).any()
 
     def test_schema_fields_complete(self):
+        from navsim.agents.drive_jepa_perception_based.experience.descriptors import (
+            DESCRIPTOR_FIELDS_EXT,
+        )
         d = compute_interaction_descriptor(ego_seq(), j_seq(x=6.0), 0.0, 0.0)
-        assert set(d.keys()) == set(DESCRIPTOR_FIELDS)
+        assert set(d.keys()) == set(DESCRIPTOR_FIELDS_EXT)
         assert len(DESCRIPTOR_FIELDS) == NUM_DESCRIPTOR_FIELDS
 
 
@@ -256,3 +259,51 @@ class TestWrapAngle:
         assert wrap_angle(3 * np.pi / 2) == pytest.approx(-np.pi / 2)
         assert wrap_angle(0.0) == 0.0
         assert wrap_angle(np.pi) == pytest.approx(-np.pi)
+
+
+class TestVruExtension:
+    def test_ext_fields_do_not_change_vehicle_fields(self):
+        """DESCRIPTOR_FIELDS layout unchanged; EXT appends exactly 2 fields."""
+        from navsim.agents.drive_jepa_perception_based.experience.descriptors import (
+            ACLASS_BICYCLE,
+            ACLASS_PEDESTRIAN,
+            ACLASS_VEHICLE,
+            DESCRIPTOR_FIELDS_EXT,
+        )
+        assert DESCRIPTOR_FIELDS_EXT[: len(DESCRIPTOR_FIELDS)] == DESCRIPTOR_FIELDS
+        assert DESCRIPTOR_FIELDS_EXT[-2:] == ["agent_class", "emerging"]
+        assert NUM_DESCRIPTOR_FIELDS == len(DESCRIPTOR_FIELDS)
+        assert ACLASS_VEHICLE == 0 and ACLASS_PEDESTRIAN == 1 and ACLASS_BICYCLE == 2
+
+    def test_emerging_flag_set(self):
+        """Absent at t=0, present + conflicting later -> emerging=1."""
+        d = compute_interaction_descriptor(
+            ego_seq(), j_seq_absent_until(3), 0.0, 0.0,
+            agent_class=1.0,
+        )
+        assert d["conflict"] == 1.0
+        assert d["emerging"] == 1.0
+        assert d["agent_class"] == 1.0
+        # no t=0 state -> deployment fields stay NaN
+        assert np.isnan(d["rel_x"])
+        assert np.isnan(d["rel_heading"])
+        assert np.isnan(d["speed"])
+
+    def test_emerging_flag_requires_conflict(self):
+        """t0-absent but never conflicting -> emerging=0."""
+        polys = [None] * (T + 1)
+        for t in range(3, T + 1):
+            polys[t] = box(100, 99, 102, 101)
+        d = compute_interaction_descriptor(ego_seq(), polys, 0.0, 0.0)
+        assert d["conflict"] == 0.0
+        assert d["emerging"] == 0.0
+
+    def test_present_at_t0_not_emerging(self):
+        d = compute_interaction_descriptor(ego_seq(), j_seq(x=6.0), 0.0, 0.0)
+        assert d["conflict"] == 1.0
+        assert d["emerging"] == 0.0
+        assert d["agent_class"] == 0.0
+
+    def test_default_agent_class_vehicle(self):
+        d = compute_interaction_descriptor(ego_seq(), j_seq(x=6.0), 0.0, 0.0)
+        assert d["agent_class"] == 0.0
