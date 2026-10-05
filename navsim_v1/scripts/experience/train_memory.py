@@ -54,6 +54,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (  #
     pairwise_hinge,
     retrieval_kl,
     score_with_delta,
+    top1_loss,
 )
 
 MU = 0.05          # memory-dependence margin
@@ -219,6 +220,13 @@ def main():
                    help="memory-dependence margin for L_c")
     p.add_argument("--hard_w", type=float, default=HARD_W,
                    help="loss weight for hard (B0-wrong) scenes")
+    p.add_argument("--loss", choices=["old", "top1"], default="old",
+                   help="top1: KL trust region + fix/keep margins "
+                        "(replaces listwise CE + hinge)")
+    p.add_argument("--lam_kl", type=float, default=1.0)
+    p.add_argument("--lam_keep", type=float, default=0.5)
+    p.add_argument("--eval_half", action="store_true",
+                   help="run val eval twice per epoch (half and end)")
     p.add_argument("--k", type=int, default=K_RETR)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_scenes", type=int, default=None)
@@ -277,6 +285,50 @@ def main():
         return log_lut[l]
 
     best_val = -1.0
+
+    def run_val(tag, ldict, t0):
+        """val selection eval -> metrics, ckpt save. Returns val_final."""
+        vf, picks, sub, b0v, _, dflat = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device)
+        vf_s, _, _, _, _, dflat_s = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device, shuffle=True)
+        sub_f = sub[..., 5]
+        b0_pick = b0v.argmax(1)
+        vf_b0 = sub_f[np.arange(len(sub)), b0_pick]
+        vf_pick = sub_f[np.arange(len(sub)), picks]
+        wrong = vf_b0 < sub_f.max(1) - 0.05
+        n_hard = int(wrong.sum())
+        fix_rate = float((((picks != b0_pick) & (vf_pick > vf_b0))
+                          [wrong]).mean()) if wrong.any() else 0.0
+        break_rate = float((vf_pick < vf_b0 - 0.05)[~wrong].mean()) \
+            if (~wrong).any() else 0.0
+        dstd = float((dflat - dflat.mean(1, keepdims=True)).std(1).mean())
+        flip = float((picks != b0_pick).mean())
+        dgap = float(np.abs(dflat - dflat_s).mean())
+        rec = dict(epoch=tag, **ldict,
+                   val_final=float(vf.mean()),
+                   val_final_shuffle=float(vf_s.mean()),
+                   val_minus_shuf=float(vf.mean() - vf_s.mean()),
+                   val_final_b0=float(vf_b0.mean()),
+                   delta_mean=float(dflat.mean()),
+                   delta_std=float(dflat.std()),
+                   delta_big=float((np.abs(dflat) > 0.1).mean()),
+                   dstd=dstd, flip=flip, dgap=dgap,
+                   fix_rate=fix_rate, break_rate=break_rate,
+                   n_hard_scenes=n_hard,
+                   secs=round(time.time() - t0, 1))
+        hist.append(rec)
+        print(f"[mem] {tag} loss={ldict['loss']:.4f} lret={ldict['lret']:.4f} "
+              f"lc={ldict['lc']:.4f} val={rec['val_final']:.4f} "
+              f"shuf={rec['val_final_shuffle']:.4f} "
+              f"({rec['val_minus_shuf']:+.4f}) "
+              f"b0={rec['val_final_b0']:.4f} "
+              f"dstd={dstd:.4f} flip={flip:.3f} dgap={dgap:.4f} "
+              f"fix={fix_rate:.3f} brk={break_rate:.3f} "
+              f"({rec['secs']}s)", flush=True)
+        keynet.train(); memenc.train(); delta.train()
+        return rec, vf.mean()
+
     for ep in range(args.epochs):
         t0 = time.time()
         keynet.train(); memenc.train(); delta.train()
@@ -285,6 +337,7 @@ def main():
         loader = DataLoader(train_ds, batch_size=args.batch_size,
                             shuffle=True, num_workers=args.num_workers,
                             collate_fn=collate_cache, drop_last=True)
+        half_at = len(loader) // 2 if args.eval_half else -1
         for b in loader:
             B = b["key_src"].shape[0]
             ks = b["key_src"].to(device)
@@ -333,12 +386,20 @@ def main():
                                  torch.tensor(args.hard_w, device=device),
                                  torch.tensor(1.0, device=device))
 
-                lce = listwise_ce(scores, final, weight=hw)
-                lhinge = pairwise_hinge(scores, final, weight=hw)
+                lce = lhinge = ks.new_zeros(())
                 # delta regulariser: penalise within-scene demeaned delta spread
                 ldr = (dl - dl.mean(1, keepdim=True)).pow(2).mean()
-                lmain = (lce + args.lam_hinge * lhinge
-                         + args.lam_dreg * ldr)
+                b0_t = b["b0"].to(device)
+                if args.loss == "top1":
+                    lcore, _ = top1_loss(scores, b0_t, final,
+                                         lam_kl=args.lam_kl,
+                                         lam_keep=args.lam_keep)
+                    lmain = lcore + args.lam_dreg * ldr
+                else:
+                    lce = listwise_ce(scores, final, weight=hw)
+                    lhinge = pairwise_hinge(scores, final, weight=hw)
+                    lmain = (lce + args.lam_hinge * lhinge
+                             + args.lam_dreg * ldr)
 
                 # memory-dependence constraint: deranged neighbours
                 # (same 'wrong memory' semantics as eval shuffle arm)
@@ -350,9 +411,18 @@ def main():
                     pad_s = ~valid_s[:, :, None].expand(-1, -1, Kq)
                     pad_s = pad_s.reshape(B, -1) | drop   # same dropout draw
                     dl_s = delta(at, yf, mem_s, pad_mask=pad_s)
-                    sc_s = score_with_delta(b["b0"].to(device), dl_s)
-                    l_s = listwise_ce(sc_s, final, weight=hw)
-                    lc = F.relu(args.mu - (l_s - lce))
+                    sc_s = score_with_delta(b0_t, dl_s)
+                    ldr_s = (dl_s - dl_s.mean(1, keepdim=True)).pow(2).mean()
+                    if args.loss == "top1":
+                        l_s, _ = top1_loss(sc_s, b0_t, final,
+                                           lam_kl=args.lam_kl,
+                                           lam_keep=args.lam_keep)
+                        l_s = l_s + args.lam_dreg * ldr_s
+                        l_ref = lcore
+                    else:
+                        l_s = listwise_ce(sc_s, final, weight=hw)
+                        l_ref = lce
+                    lc = F.relu(args.mu - (l_s - l_ref))
                     lmain = lmain + args.lam_c * lc
 
             loss = lmain + args.lam_ret * lret
@@ -362,39 +432,22 @@ def main():
             ep_loss += float(loss); ep_ret += float(lret)
             ep_c += float(lc); ep_main += float(lce)
             nb += 1
+            if nb == half_at:
+                ld = dict(loss=ep_loss / nb, lret=ep_ret / nb,
+                          lmain=ep_main / nb, lc=ep_c / nb)
+                rec, vfm = run_val(f"ep{ep}h", ld, t0)
+                ck = dict(args=vars(args), keynet=keynet.state_dict(),
+                          memenc=memenc.state_dict(), delta=delta.state_dict(),
+                          epoch=ep, val_final=rec["val_final"])
+                torch.save(ck, out_dir / "model.pt")
+                if rec["val_final"] > best_val:
+                    best_val = rec["val_final"]
+                    torch.save(ck, out_dir / "model_best.pt")
 
-        # ---- val: selection final (lret / shuffle / b0) + Delta stats ------
-        vf, picks, sub, b0v, _, dflat = eval_selection(
-            bank, keynet, memenc, delta, val_ds, device)
-        vf_s, _, _, _, _, dflat_s = eval_selection(
-            bank, keynet, memenc, delta, val_ds, device, shuffle=True)
-        sub_f = sub[..., 5]
-        vf_b0 = sub_f[np.arange(len(sub)), b0v.argmax(1)]
-        n_hard = int((vf_b0 < sub_f.max(1) - 0.05).sum())
-        # memory-usage diagnostics
-        dstd = float((dflat - dflat.mean(1, keepdims=True)).std(1).mean())
-        flip = float((picks != b0v.argmax(1)).mean())
-        dgap = float(np.abs(dflat - dflat_s).mean())
-        rec = dict(epoch=ep, loss=ep_loss / nb, lret=ep_ret / nb,
-                   lmain=ep_main / nb, lc=ep_c / nb,
-                   val_final=float(vf.mean()),
-                   val_final_shuffle=float(vf_s.mean()),
-                   val_minus_shuf=float(vf.mean() - vf_s.mean()),
-                   val_final_b0=float(vf_b0.mean()),
-                   delta_mean=float(dflat.mean()),
-                   delta_std=float(dflat.std()),
-                   delta_big=float((np.abs(dflat) > 0.1).mean()),
-                   dstd=dstd, flip=flip, dgap=dgap,
-                   n_hard_scenes=n_hard,
-                   secs=round(time.time() - t0, 1))
-        hist.append(rec)
-        print(f"[mem] ep{ep} loss={rec['loss']:.4f} lret={rec['lret']:.4f} "
-              f"lc={rec['lc']:.4f} val={rec['val_final']:.4f} "
-              f"shuf={rec['val_final_shuffle']:.4f} "
-              f"({rec['val_minus_shuf']:+.4f}) "
-              f"b0={rec['val_final_b0']:.4f} "
-              f"dstd={dstd:.4f} flip={flip:.3f} dgap={dgap:.4f} "
-              f"({rec['secs']}s)", flush=True)
+        # ---- end-of-epoch val ----
+        ld = dict(loss=ep_loss / nb, lret=ep_ret / nb,
+                  lmain=ep_main / nb, lc=ep_c / nb)
+        rec, vfm = run_val(f"ep{ep}", ld, t0)
         ck = dict(args=vars(args), keynet=keynet.state_dict(),
                   memenc=memenc.state_dict(), delta=delta.state_dict(),
                   epoch=ep, val_final=rec["val_final"])

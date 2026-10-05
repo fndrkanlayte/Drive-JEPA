@@ -16,6 +16,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (
     pairwise_hinge,
     retrieval_kl,
     score_with_delta,
+    top1_loss,
 )
 
 K, S_BANK, Q_LOG, B_LOG = 32, 40, "logQ", "logB"
@@ -238,6 +239,26 @@ def test_delta_cap_bounds_and_zero_init():
     d = delta(a, yh, mem)
     assert d.abs().max() <= cap + 1e-6
     assert (d.abs() > 0).any()                         # cap doesn't zero it
+
+
+def test_top1_loss_anchor_properties():
+    # scene 0: B0 picks badly (b0pick has low final); scene 1: B0 correct
+    b0 = torch.tensor([[0.9, 0.05, 0.05],
+                       [0.8, 0.1, 0.1]])
+    final = torch.tensor([[0.4, 0.95, 0.3],
+                          [0.9, 0.5, 0.3]])
+    # delta=0 => scores=logit(b0): lkl=0, lfix>0 (scene0), lkeep=0 (margins ok)
+    scores0 = score_with_delta(b0, torch.zeros(2, 3))
+    l0, parts0 = top1_loss(scores0, b0, final)
+    assert parts0["lkl"].item() == pytest.approx(0.0, abs=1e-6)
+    assert parts0["n_wrong"] == 1
+    assert parts0["lkeep"].item() == pytest.approx(0.0, abs=1e-6)
+    assert parts0["lfix"].item() > 0
+    # push best candidate above b0pick by margin -> lfix = 0
+    scores_fix = scores0.clone()
+    scores_fix[0, 1] = scores0[0, 0] + 0.6
+    _, parts_fix = top1_loss(scores_fix, b0, final)
+    assert parts_fix["lfix"].item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_retrieval_kl_runs():

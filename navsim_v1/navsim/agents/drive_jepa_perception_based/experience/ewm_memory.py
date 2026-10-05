@@ -198,6 +198,54 @@ def pairwise_hinge(scores: torch.Tensor, final: torch.Tensor,
     return loss / max(cnt, 1)
 
 
+def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
+              final: torch.Tensor, lam_kl: float = 1.0,
+              lam_keep: float = 0.5, m: float = 0.5,
+              T: float = 1.0) -> tuple:
+    """Top-1 anchored objective (Devin Bot spec).
+
+    lkl   = KL(softmax(logit_b0/T) || softmax(scores/T))   trust region on all
+    lfix  = relu(m - (score[best] - score[b0pick]))        B0-wrong scenes only,
+            best = argmax final with B0-logit tie-break
+    lkeep = mean_k relu(m - (score[b0pick] - score[k]))    B0-correct scenes,
+            over k with final[k] < final[b0pick] - .05
+    returns (lmain, dict of parts) where
+    lmain = lfix + lam_keep*lkeep + lam_kl*lkl."""
+    logit_b0 = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
+    lkl = F.kl_div(F.log_softmax(scores / T, dim=-1),
+                   F.softmax(logit_b0 / T, dim=-1),
+                   reduction="batchmean")
+
+    b0pick = b0.argmax(1)                              # (B,)
+    f_b0 = final.gather(1, b0pick[:, None]).squeeze(1)
+    s_b0 = scores.gather(1, b0pick[:, None]).squeeze(1)
+    f_best = final.max(1).values
+    wrong = f_b0 < f_best - 0.05                       # B0 picked badly
+
+    # best candidate: argmax final, ties broken by highest B0 logit
+    is_best = final >= (f_best[:, None] - 1e-9)
+    best_idx = logit_b0.masked_fill(~is_best, -1e9).argmax(1)
+    s_best = scores.gather(1, best_idx[:, None]).squeeze(1)
+    lfix_per = F.relu(m - (s_best - s_b0))
+    if wrong.any():
+        lfix = lfix_per[wrong].mean()
+    else:
+        lfix = scores.new_zeros(())
+
+    correct = ~wrong
+    worse_k = final < (f_b0[:, None] - 0.05)
+    viol = F.relu(m - (s_b0[:, None] - scores)) * worse_k
+    per_scene = viol.sum(1) / worse_k.sum(1).clamp(min=1)
+    if correct.any():
+        lkeep = per_scene[correct].mean()
+    else:
+        lkeep = scores.new_zeros(())
+
+    lmain = lfix + lam_keep * lkeep + lam_kl * lkl
+    return lmain, dict(lkl=lkl, lfix=lfix, lkeep=lkeep,
+                       n_wrong=int(wrong.sum()))
+
+
 def retrieval_kl(g: KeyNet, key_src: torch.Tensor, o: torch.Tensor,
                  o_mask: torch.Tensor, log_id: torch.Tensor,
                  t: float = 0.1, T: float = 1.0) -> torch.Tensor:
