@@ -62,9 +62,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ckpt = torch.load(Path(args.run) / "model_best.pt", map_location="cpu",
                   weights_only=False)
+no_latent = bool(ckpt.get("args", {}).get("no_latent", False))
 keynet = KeyNet().to(device); keynet.load_state_dict(ckpt["keynet"])
-memenc = MemTokenEnc().to(device); memenc.load_state_dict(ckpt["memenc"])
-delta = MemoryDelta().to(device); delta.load_state_dict(ckpt["delta"])
+memenc = MemTokenEnc(no_latent=no_latent).to(device)
+memenc.load_state_dict(ckpt["memenc"])
+delta = MemoryDelta(no_latent=no_latent).to(device)
+delta.load_state_dict(ckpt["delta"])
 keynet.eval(); memenc.eval(); delta.eval()
 for m in (keynet, memenc, delta):
     for q in m.parameters():

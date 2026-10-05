@@ -70,12 +70,15 @@ class TrajEnc(nn.Module):
 
 
 class MemTokenEnc(nn.Module):
-    """m_ij = MLP([z_pool(256), Enc(tau)(64), y_t flat(320), s(6), b0(1)]) -> 256."""
+    """m_ij = MLP([z_pool(256), Enc(tau)(64), y_t flat(320), s(6), b0(1)]) -> 256.
+    no_latent=True drops the y_t block (appearance+trajectory+scores only)."""
 
-    def __init__(self, d: int = D_SCENE):
+    def __init__(self, d: int = D_SCENE, no_latent: bool = False):
         super().__init__()
+        self.no_latent = no_latent
         self.traj = TrajEnc()
-        self.proj = nn.Sequential(nn.Linear(D_SCENE + 64 + N_SLOTS * D_LAT + N_SUB + 1, d),
+        in_dim = D_SCENE + 64 + N_SUB + 1 + (0 if no_latent else N_SLOTS * D_LAT)
+        self.proj = nn.Sequential(nn.Linear(in_dim, d),
                                   nn.GELU(), nn.Linear(d, d))
 
     def forward(self, z_pool: torch.Tensor, traj: torch.Tensor,
@@ -83,18 +86,24 @@ class MemTokenEnc(nn.Module):
                 b0: torch.Tensor) -> torch.Tensor:
         """z_pool (...,256); traj (...,8,3); y_t (...,5,64); s (...,6); b0 (...,)"""
         t = self.traj(traj)
-        x = torch.cat([z_pool, t, y_t.flatten(-2), s,
-                       b0.unsqueeze(-1)], dim=-1)
-        return self.proj(x)
+        parts = [z_pool, t]
+        if not self.no_latent:
+            parts.append(y_t.flatten(-2))
+        parts += [s, b0.unsqueeze(-1)]
+        return self.proj(torch.cat(parts, dim=-1))
 
 
 class MemoryDelta(nn.Module):
     """h_k = [a_k(256), y_hat_k flat(320)] -> q_proj; 2 XAttn layers over
-    k*32 memory tokens -> scalar Delta_k (zero-init output head)."""
+    k*32 memory tokens -> scalar Delta_k (zero-init output head).
+    no_latent=True queries with a_k alone (yhat ignored)."""
 
-    def __init__(self, d: int = D_SCENE, n_heads: int = 4):
+    def __init__(self, d: int = D_SCENE, n_heads: int = 4,
+                 no_latent: bool = False):
         super().__init__()
-        self.q_proj = nn.Linear(D_SCENE + N_SLOTS * D_LAT, d)
+        self.no_latent = no_latent
+        self.q_proj = nn.Linear(D_SCENE + (0 if no_latent else N_SLOTS * D_LAT),
+                                d)
         self.attn = nn.ModuleList(
             nn.MultiheadAttention(d, n_heads, batch_first=True)
             for _ in range(2))
@@ -109,7 +118,10 @@ class MemoryDelta(nn.Module):
         """a (B,K,256); yhat_flat (B,K,320); mem (B,M,256);
         pad_mask (B,M) bool, True = ignore that memory token.
         Rows whose memory is fully masked get Delta = 0."""
-        h = self.q_proj(torch.cat([a, yhat_flat], dim=-1))
+        if self.no_latent:
+            h = self.q_proj(a)
+        else:
+            h = self.q_proj(torch.cat([a, yhat_flat], dim=-1))
         fully = None
         if pad_mask is not None:
             pad_mask = pad_mask.clone()

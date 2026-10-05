@@ -206,6 +206,9 @@ def main():
     p.add_argument("--k", type=int, default=K_RETR)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_scenes", type=int, default=None)
+    p.add_argument("--no_latent", action="store_true",
+                   help="ablation: drop yhat/y_t from memory tokens and "
+                        "query head (appearance+traj+scores only)")
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--out_dir", required=True)
     args = p.parse_args()
@@ -230,8 +233,8 @@ def main():
     # leak into memory); navtest eval builds its own full-navtrain bank
     bank_ds = CacheDataset(train_tokens, cache)
     keynet = KeyNet().to(device)
-    memenc = MemTokenEnc().to(device)
-    delta = MemoryDelta().to(device)
+    memenc = MemTokenEnc(no_latent=args.no_latent).to(device)
+    delta = MemoryDelta(no_latent=args.no_latent).to(device)
     if args.key_ckpt:
         keynet.load_state_dict(torch.load(args.key_ckpt, map_location="cpu"))
         print(f"[mem] loaded key_ckpt {args.key_ckpt}", flush=True)

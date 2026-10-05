@@ -154,6 +154,28 @@ def test_derange_cross_log():
     assert (logs[src] != logs).all()
 
 
+def test_no_latent_flag_shapes_and_zero_init():
+    """--no_latent: MemTokenEnc drops y_t, MemoryDelta queries a only;
+    zero-init Delta must still equal B0 argmax."""
+    enc = MemTokenEnc(no_latent=True)
+    z = torch.randn(2, 3, 4, D_SCENE)
+    t = torch.randn(2, 3, 4, 8, 3)
+    yt = torch.randn(2, 3, 4, N_SLOTS, D_LAT)
+    s = torch.randn(2, 3, 4, N_SUB)
+    b0v = torch.rand(2, 3, 4)
+    out = enc(z, t, yt, s, b0v)
+    assert out.shape == (2, 3, 4, D_SCENE)
+    delta = MemoryDelta(no_latent=True)
+    a = torch.randn(2, 4, D_SCENE)
+    yh = torch.randn(2, 4, N_SLOTS * D_LAT)
+    mem = torch.randn(2, 12, D_SCENE)
+    d = delta(a, yh, mem)
+    assert d.shape == (2, 4)
+    assert torch.allclose(d, torch.zeros_like(d))      # zero-init = B0
+    sc = score_with_delta(b0v[:, 0], d[:, :4])
+    assert (sc.argmax(1) == b0v[:, 0].argmax(1)).all()
+
+
 def test_pad_mask_full_row_gives_zero_delta():
     delta = MemoryDelta()
     torch.nn.init.normal_(delta.out.weight, std=0.1)
