@@ -93,7 +93,7 @@ from navsim.agents.drive_jepa_perception_based.experience.records import (  # no
     split_logs_by_name,
 )
 
-SUB_NC, SUB_TTC = 0, 3
+SUB_NC, SUB_TTC, SUB_FINAL = 0, 3, 5
 TARGET_NAMES = ["nc_unsafe", "ttc_bad"]
 VARIANTS = ["noexp", "noexp_int", "random", "retrieval", "retrieval_int",
             "shuffle", "pred_desc_retrieval", "pred_desc_retrieval_pp"]
@@ -124,6 +124,14 @@ def parse_args():
     p.add_argument("--aux_weight", type=float, default=0.5)
     p.add_argument("--num_boot", type=int, default=1000)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
+    p.add_argument("--task", choices=["risk", "residual"], default="risk",
+                   help="risk: BCE on nc_unsafe/ttc_bad. residual: Huber "
+                        "regression on y_res = labelled final - pdm_score "
+                        "(single output; neighbour 'labels' become y_res).")
+    p.add_argument("--save_models", action="store_true",
+                   help="save per-variant+seed state_dicts + meta to "
+                        "<out_dir>/models/ (for post-hoc eval, e.g. "
+                        "memory-size ablation).")
     p.add_argument("--device",
                    default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     return p.parse_args()
@@ -132,7 +140,7 @@ def parse_args():
 def load_rows(labels_dir: Path, export_dir: Path,
               dt_enter_thresh: float = 2.0) -> Dict[str, np.ndarray]:
     """Join label + export npz into per-candidate row arrays."""
-    X, Y, AUX, AUX_MASK, DESC = [], [], [], [], []
+    X, Y, AUX, AUX_MASK, DESC, PDM, FIN = [], [], [], [], [], [], []
     scene_id, log_name, in_subset = [], [], []
     tokens, logs_sc = [], []
     sid = 0
@@ -177,6 +185,8 @@ def load_rows(labels_dir: Path, export_dir: Path,
         ])  # (K, D_desc) raw, NaNs preserved
         X.append(x); Y.append(y); AUX.append(aux); AUX_MASK.append(aux_mask)
         DESC.append(desc)
+        PDM.append(np.asarray(exp["pdm_score"], dtype=np.float32))
+        FIN.append(lab["subscores"][:, 5].astype(np.float32))
         scene_id.append(np.full(K, sid)); log_name += [str(lab["log_name"].item())] * K
         in_subset.append(subset)
         tokens.append(str(lab["token"].item()))
@@ -186,6 +196,7 @@ def load_rows(labels_dir: Path, export_dir: Path,
         x=np.concatenate(X), y=np.concatenate(Y),
         aux=np.concatenate(AUX), aux_mask=np.concatenate(AUX_MASK),
         desc=np.concatenate(DESC),
+        pdm=np.concatenate(PDM), final=np.concatenate(FIN),
         scene_id=np.concatenate(scene_id), log=np.asarray(log_name),
         subset=np.concatenate(in_subset),
         tokens=np.asarray(tokens), scene_log=np.asarray(logs_sc),
@@ -225,7 +236,7 @@ def aux_loss_fn(aux_out, aux, aux_mask, torch):
     return loss
 
 
-def predict(model, x_t, exp_np, device, batch=8192):
+def predict(model, x_t, exp_np, device, batch=8192, sigmoid=True):
     import torch
     model.eval()
     outs = []
@@ -233,7 +244,33 @@ def predict(model, x_t, exp_np, device, batch=8192):
         for i in range(0, len(x_t), batch):
             e = torch.from_numpy(exp_np[i:i + batch]).to(device)
             logits, _, _, _ = model(x_t[i:i + batch].to(device), e)
-            outs.append(torch.sigmoid(logits).cpu().numpy())
+            outs.append(
+                (torch.sigmoid(logits) if sigmoid else logits).cpu().numpy())
+    return np.concatenate(outs)
+
+
+def conf_rows(model, x_t, device, conf_col: int = 0, zm_c: float = 0.0,
+              zs_c: float = 1.0, batch: int = 8192) -> Optional[np.ndarray]:
+    """Per-candidate conflict score for gating (Q2).
+
+    int_head -> sigmoid(conflict logit); desc_head -> predicted desc_z in the
+    conflict col mapped back to raw units (approx probability). None if the
+    model has neither head.
+    """
+    import torch
+    if model.int_head is None and model.desc_head is None:
+        return None
+    model.eval()
+    outs = []
+    with torch.no_grad():
+        for i in range(0, len(x_t), batch):
+            z = model.encoder(x_t[i:i + batch].to(device))
+            if model.int_head is not None:
+                outs.append(torch.sigmoid(
+                    model.int_head(z)[:, 0]).cpu().numpy())
+            else:
+                d = model.desc_head(z)[:, conf_col].cpu().numpy()
+                outs.append(d * zs_c + zm_c)
     return np.concatenate(outs)
 
 
@@ -266,8 +303,10 @@ def train_pred_desc(variant: str, seed: int, rows: Dict[str, np.ndarray],
     latent = 64
     cont_cols = rows["cont_cols"]
     exp_dim = exp_dim_for(variant, latent, n_cont=len(cont_cols))
+    n_targets = rows["y"].shape[1]
     model = ExperienceModel(x_all.shape[1], latent + exp_dim,
-                            desc_dim=D_desc).to(device)
+                            desc_dim=D_desc, n_targets=n_targets).to(device)
+    residual = args.task == "residual"
 
     # phase 1: descriptor prediction
     opt = torch.optim.Adam(
@@ -315,13 +354,16 @@ def train_pred_desc(variant: str, seed: int, rows: Dict[str, np.ndarray],
             pos = perm[i0:i0 + args.batch_size]
             bi = tr_idx[pos]
             logits, _, _, _ = model(x_all[bi].to(device), exp_tr[pos].to(device))
-            loss = TF.binary_cross_entropy_with_logits(
-                logits, y_all[bi].to(device))
+            if residual:
+                loss = TF.huber_loss(logits[:, 0], y_all[bi, 0].to(device))
+            else:
+                loss = TF.binary_cross_entropy_with_logits(
+                    logits, y_all[bi].to(device))
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-    pred = predict(model, x_all[q_idx], exp, device)
+    pred = predict(model, x_all[q_idx], exp, device, sigmoid=not residual)
     return {"model": model, "val": pred[len(tr_idx):],
             "use_pred_mem": use_pred_mem}
 
@@ -348,8 +390,10 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
 
     latent = 64
     use_int = variant in ("retrieval_int", "noexp_int")
+    n_targets = rows["y"].shape[1]
+    residual = args.task == "residual"
     model = ExperienceModel(x_all.shape[1], latent + exp_dim_for(variant, latent),
-                            use_int=use_int).to(device)
+                            use_int=use_int, n_targets=n_targets).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     mem_x = torch.from_numpy(mem_rows["x"]).float()
@@ -386,7 +430,11 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
             xb = x_all[bi].to(device)
             eb = exp_tr[pos].to(device)
             logits, z, aux_out, _ = model(xb, eb)
-            loss = TF.binary_cross_entropy_with_logits(logits, y_all[bi].to(device))
+            if residual:
+                loss = TF.huber_loss(logits[:, 0], y_all[bi, 0].to(device))
+            else:
+                loss = TF.binary_cross_entropy_with_logits(
+                    logits, y_all[bi].to(device))
             if use_int and aux_out is not None:
                 loss = loss + args.aux_weight * aux_loss_fn(
                     aux_out, aux_all[bi].to(device), auxm_all[bi].to(device), torch)
@@ -403,23 +451,26 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
                         np.random.default_rng(seed + 777))
     else:
         exp = exp_static
-    pred = predict(model, x_all[q_idx], exp, device)
+    pred = predict(model, x_all[q_idx], exp, device, sigmoid=not residual)
     out = {"model": model, "val": pred[len(tr_idx):]}
     if variant == "retrieval":
         exp_sh = build_exp(variant, q_lat, rows["scene_id"][q_idx],
                            rows["log"][q_idx], mem, args,
                            np.random.default_rng(seed + 778), shuffle_labels=True)
-        out["val_shuffle"] = predict(model, x_all[q_idx], exp_sh, device)[len(tr_idx):]
+        out["val_shuffle"] = predict(
+            model, x_all[q_idx], exp_sh, device,
+            sigmoid=not residual)[len(tr_idx):]
     return out
 
 
 def predict_navtest(model, variant: str, nt: Dict[str, np.ndarray],
                     mem_rows: Dict[str, np.ndarray], args,
                     seed: int) -> np.ndarray:
-    """Risk (N,2) for navtest rows; memory bank = navtrain labelled rows."""
+    """Risk/residual (N,C) for navtest rows; memory bank = navtrain rows."""
     import torch
     device = args.device
     rng = np.random.default_rng(seed + 9000)
+    residual = args.task == "residual"
     mem_x = torch.from_numpy(mem_rows["x"]).float()
     nt_x = torch.from_numpy(nt["x"]).float()
     if variant.startswith("pred_desc"):
@@ -435,14 +486,14 @@ def predict_navtest(model, variant: str, nt: Dict[str, np.ndarray],
             mem_rows["scene_id"], mem_rows["log"], nt["cont_cols"],
             mem_valid, topk=args.topk, max_per_scene=args.max_per_scene,
             device=device)
-        return predict(model, nt_x, exp, device)
+        return predict(model, nt_x, exp, device, sigmoid=not residual)
     mem = {"y": mem_rows["y"], "scene_id": mem_rows["scene_id"],
            "log": mem_rows["log"],
            "latent": encode_rows(model, mem_x, device=device)}
     q_lat = encode_rows(model, nt_x, device=device)
     exp = build_exp(variant, q_lat, nt["scene_id"], nt["log"], mem, args, rng,
                     shuffle_labels=(variant == "shuffle"))
-    return predict(model, nt_x, exp, device)
+    return predict(model, nt_x, exp, device, sigmoid=not residual)
 
 
 def main() -> None:
@@ -455,6 +506,13 @@ def main() -> None:
                      args.dt_enter_thresh)
     n_scenes = int(rows["n_scenes"])
     print(f"[exp] {n_scenes} scenes, {len(rows['y'])} candidates")
+    residual = args.task == "residual"
+    if residual:
+        # Q1: y_res = labelled final - model pdm_score (Huber regression)
+        rows["y"] = (rows["final"] - rows["pdm"])[:, None].astype(np.float32)
+        print(f"[exp] residual target: mean={rows['y'].mean():+.4f} "
+              f"std={rows['y'].std():.4f}")
+    target_names = ["y_res"] if residual else TARGET_NAMES
 
     logs = sorted(set(rows["log"].tolist()))
     groups = split_logs_by_name(logs, ratios=args.ratios, seed=args.split_seed)
@@ -463,10 +521,11 @@ def main() -> None:
     print(f"[exp] logs: memory={len(groups['memory'])} "
           f"query_train={len(groups['query_train'])} "
           f"query_val={len(groups['query_val'])}")
-    for ti, tname in enumerate(TARGET_NAMES):
+    for ti, tname in enumerate(target_names):
         for sp in ("memory", "query_train", "query_val"):
             m = rows["group"] == sp
-            print(f"[exp] pos-rate {tname} {sp}: {rows['y'][m, ti].mean():.4f}")
+            print(f"[exp] {'mean' if residual else 'pos-rate'} "
+                  f"{tname} {sp}: {rows['y'][m, ti].mean():.4f}")
 
     # descriptor standardization on query_train (pred_desc variants)
     qtr_mask0 = np.array([group_of[l] for l in rows["log"]]) == "query_train"
@@ -500,6 +559,24 @@ def main() -> None:
             t1 = time.time()
             runs[variant].append(train_one(real, seed, rows, mem_rows, args))
             print(f"[exp]   done in {time.time()-t1:.0f}s", flush=True)
+            if args.save_models:
+                import torch
+                mdir = out_dir / "models"
+                mdir.mkdir(exist_ok=True)
+                torch.save(
+                    {"state_dict": runs[variant][-1]["model"].state_dict(),
+                     "meta": {"variant": variant, "seed": seed,
+                              "task": args.task,
+                              "feat_in": rows["x"].shape[1],
+                              "n_targets": rows["y"].shape[1],
+                              "use_int": variant in ("retrieval_int",
+                                                     "noexp_int"),
+                              "desc_dim": (rows["desc_z"].shape[1]
+                                           if variant.startswith("pred_desc")
+                                           else 0),
+                              "n_cont": len(rows["cont_cols"]),
+                              "latent": 64}},
+                    mdir / f"{variant}_seed{seed}.pt")
 
     # ---- evaluate on query_val ---------------------------------------------
     table_rows: List[List[str]] = []
@@ -513,6 +590,19 @@ def main() -> None:
         if not per_seed:
             continue
         pred_va = np.mean(per_seed, axis=0)
+        if residual:
+            for sub_name, sub_mask in (("all", None), ("conflict", val_sub)):
+                sel = np.ones(len(val_y), bool) if sub_mask is None else sub_mask
+                if sel.sum() == 0:
+                    continue
+                pv, tv = pred_va[sel, 0], val_y[sel, 0]
+                mae = float(np.abs(pv - tv).mean())
+                corr = float(np.corrcoef(pv, tv)[0, 1]) if pv.std() > 0 else 0.0
+                res = {"mae": mae, "pearson": corr}
+                results[f"{variant}|y_res|{sub_name}"] = res
+                table_rows.append([variant, "y_res", sub_name,
+                                   f"{mae:.4f}", f"{corr:.4f}", "-"])
+            continue
         for ti, tname in enumerate(TARGET_NAMES):
             for sub_name, sub_mask in (("all", None), ("conflict", val_sub)):
                 sel = np.ones(len(val_y), bool) if sub_mask is None else sub_mask
@@ -539,10 +629,28 @@ def main() -> None:
             continue
         key = "val_shuffle" if variant == "shuffle" else "val"
         per_seed = np.stack([r[key] for r in runs[real] if key in r])
+        C = rows["y"].shape[1]
+        import torch
+        conf_per_seed = [
+            conf_rows(r["model"],
+                      torch.from_numpy(
+                          rows["x"][np.flatnonzero(val_mask)]).float(),
+                      args.device, conf_col=0,
+                      zm_c=float(zm[0]), zs_c=float(zs[0]))
+            for r in runs[real]]
+        conf_arr = (None if all(c is None for c in conf_per_seed)
+                    else np.stack([
+                        c if c is not None else np.full(
+                            len(conf_per_seed[0]), np.nan)
+                        for c in conf_per_seed]).mean(0).reshape(
+                            len(val_scene_ids), -1).astype(np.float32))
+        kw = {} if conf_arr is None else {"conf": conf_arr}
         save_npz(
             qva_risk_dir / f"{variant}.npz",
             tokens=val_scene_tokens,
-            risk=per_seed.mean(0).reshape(len(val_scene_ids), -1, 2).astype(np.float32),
+            risk=per_seed.mean(0).reshape(len(val_scene_ids), -1, C).astype(
+                np.float32),
+            **kw,
         )
 
     md = ["# Experience-module results (Stage 3)", ""]
@@ -554,7 +662,10 @@ def main() -> None:
         f"max_per_scene={args.max_per_scene} | epochs={args.epochs}"
     )
     md.append("")
-    md.append("| variant | target | subset | Brier | AUPRC | top1-risk |")
+    if residual:
+        md.append("| variant | target | subset | MAE | pearson | - |")
+    else:
+        md.append("| variant | target | subset | Brier | AUPRC | top1-risk |")
     md.append("|---|---|---|---|---|---|")
     for r in table_rows:
         md.append("| " + " | ".join(r) + " |")
@@ -574,18 +685,33 @@ def main() -> None:
         nt["cont_cols"] = rows["cont_cols"]
         risk_dir = out_dir / "navtest_risk"
         n_nt = len(nt["tokens"])
+        C = rows["y"].shape[1]
+        import torch
+        nt_x = torch.from_numpy(nt["x"]).float()
         for variant, seed_runs in runs.items():
-            per_seed = np.stack([  # (nseed, S*K, 2) -> (nseed, S, K, 2)
+            per_seed = np.stack([  # (nseed, S*K, C) -> (nseed, S, K, C)
                 predict_navtest(r["model"], variant, nt, mem_rows, args, s)
-                .reshape(n_nt, -1, 2)
+                .reshape(n_nt, -1, C)
                 for s, r in zip(args.seeds, seed_runs)
             ])
+            conf_per_seed = [
+                conf_rows(r["model"], nt_x, args.device, conf_col=0,
+                          zm_c=float(zm[0]), zs_c=float(zs[0]))
+                for r in seed_runs]
+            conf_arr = (None if all(c is None for c in conf_per_seed)
+                        else np.stack([
+                            c if c is not None else np.full(
+                                len(conf_per_seed[0]), np.nan)
+                            for c in conf_per_seed]).mean(0).reshape(
+                                n_nt, -1).astype(np.float32))
+            kw = {} if conf_arr is None else {"conf": conf_arr}
             save_npz(
                 risk_dir / f"{variant}.npz",
                 tokens=nt["tokens"],
                 log_names=nt["scene_log"],
-                risk=per_seed.mean(0).astype(np.float32),      # (S,K,2)
-                risk_per_seed=per_seed.astype(np.float32),     # (nseed,S,K,2)
+                risk=per_seed.mean(0).astype(np.float32),      # (S,K,C)
+                risk_per_seed=per_seed.astype(np.float32),     # (nseed,S,K,C)
+                **kw,
             )
     print(f"[exp] done in {time.time()-t0:.0f}s -> {out_dir}")
 

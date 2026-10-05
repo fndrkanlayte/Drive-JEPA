@@ -104,10 +104,10 @@ class ExperienceModel(nn.Module):
 
     def __init__(self, feat_in_dim: int, head_in_dim: int, use_int: bool = False,
                  desc_dim: int = 0, hidden: int = 128, latent: int = 64,
-                 head_hidden: int = 64):
+                 head_hidden: int = 64, n_targets: int = N_TARGETS):
         super().__init__()
         self.encoder = ExperienceEncoder(feat_in_dim, hidden, latent)
-        self.head = RiskHead(head_in_dim, head_hidden)
+        self.head = RiskHead(head_in_dim, head_hidden, n_targets)
         self.int_head = InteractionHead(latent, head_hidden) if use_int else None
         self.desc_head = DescHead(latent, head_hidden, desc_dim) if desc_dim else None
 

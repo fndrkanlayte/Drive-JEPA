@@ -51,6 +51,8 @@ def parse_args():
     p.add_argument("--lambda_json", default=None,
                    help="rerank_results.json; per-variant tuned lambda under "
                         "'best_lambda' (missing entries -> 0)")
+    p.add_argument("--gated_json", action="store_true",
+                   help="read (lam,g) from 'best_gated' + apply conf gate")
     p.add_argument("--default_lambda", type=float, default=0.0)
     p.add_argument("--variants", nargs="*", default=None,
                    help="subset of risk files to export (default: all)")
@@ -64,8 +66,11 @@ def main() -> None:
     export_dir = Path(args.export_dir)
 
     best_lam = {}
+    best_gated = {}
     if args.lambda_json:
-        best_lam = json.loads(Path(args.lambda_json).read_text())["best_lambda"]
+        rr = json.loads(Path(args.lambda_json).read_text())
+        best_lam = rr["best_lambda"]
+        best_gated = rr.get("best_gated", {})
 
     jobs = {"original": None}
     for rp in sorted(Path(args.risk_dir).glob("*.npz")):
@@ -76,11 +81,14 @@ def main() -> None:
     for name, rp in jobs.items():
         if rp is None:
             risk_map = {}
-            lam = 0.0
+            lam, gate = 0.0, 0.0
         else:
             risk_npz = load_npz(rp)
             risk_map = {str(t): i for i, t in enumerate(risk_npz["tokens"])}
-            lam = float(best_lam.get(name, args.default_lambda))
+            if args.gated_json and name in best_gated:
+                lam, gate = [float(v) for v in best_gated[name]]
+            else:
+                lam, gate = float(best_lam.get(name, args.default_lambda)), 0.0
         tokens, trajs, n_fallback = [], [], 0
         for ep in sorted(export_dir.glob("*.npz")):
             exp = load_npz(ep)
@@ -88,8 +96,14 @@ def main() -> None:
             pdm = np.asarray(exp["pdm_score"], dtype=np.float64)
             props = np.asarray(exp["proposals"], dtype=np.float32)  # (K,8,3)
             if rp is not None and token in risk_map:
-                rh = r_hat(risk_npz["risk"][risk_map[token]][None])[0]
-                sel = int(np.argmax(pdm - lam * rh))
+                r_ = risk_npz["risk"][risk_map[token]]
+                if r_.shape[-1] == 1:               # residual: +lam * r_res
+                    corr, sign = r_[..., 0].astype(np.float64), 1.0
+                else:                                # risk: -lam * r_hat
+                    corr, sign = r_hat(r_[None])[0], -1.0
+                if gate > 0.0 and "conf" in risk_npz:
+                    corr = corr * (risk_npz["conf"][risk_map[token]] > gate)
+                sel = int(np.argmax(pdm + sign * lam * corr))
             else:
                 sel = int(np.argmax(pdm))
                 n_fallback += rp is not None
@@ -98,7 +112,7 @@ def main() -> None:
         save_npz(out_dir / f"{name}.npz",
                  tokens=np.asarray(tokens),
                  trajectories=np.stack(trajs))
-        print(f"[sel] {name}: {len(tokens)} scenes (lam={lam:g}, "
+        print(f"[sel] {name}: {len(tokens)} scenes (lam={lam:g}, gate={gate:g}, "
               f"{n_fallback} fell back to argmax) -> {out_dir / (name + '.npz')}")
 
 

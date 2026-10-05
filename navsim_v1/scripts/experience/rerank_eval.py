@@ -31,7 +31,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -49,7 +49,7 @@ from navsim.agents.drive_jepa_perception_based.experience.records import (  # no
     split_logs_by_name,
 )
 
-SUB_NC, SUB_TTC, SUB_FINAL = 0, 3, 5
+SUB_NC, SUB_EP, SUB_TTC, SUB_FINAL = 0, 2, 3, 5
 TARGET_NAMES = ["nc_unsafe", "ttc_bad"]
 
 
@@ -72,6 +72,10 @@ def parse_args():
     p.add_argument("--split_seed", type=int, default=0)
     p.add_argument("--num_boot", type=int, default=1000)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
+    p.add_argument("--gates", type=float, nargs="+",
+                   default=[0.0, 0.2, 0.4, 0.6, 0.8],
+                   help="conflict-prob gate thresholds for gated variants "
+                        "(0 = ungated; needs 'conf' in risk npz)")
     return p.parse_args()
 
 
@@ -107,9 +111,24 @@ def scene_pack(labels_dir: Path, export_dir: Path,
                 logs=np.asarray(logs))
 
 
-def select_with_risk(pdm: np.ndarray, risk: np.ndarray, lam: float) -> np.ndarray:
-    """argmax over K of pdm_score - lam * r_hat."""
-    return np.argmax(pdm - lam * r_hat(risk), axis=1)
+def corr_of(risk: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Correction term per candidate: (S,K), sign.
+
+    risk (S,K,2) -> -r_hat (penalty); risk (S,K,1) -> +r_res (residual bonus).
+    """
+    if risk.shape[-1] == 1:
+        return risk[..., 0].astype(np.float64), 1.0
+    return r_hat(risk), -1.0
+
+
+def select_with_risk(pdm: np.ndarray, risk: np.ndarray, lam: float,
+                     conf: Optional[np.ndarray] = None,
+                     gate: float = 0.0) -> np.ndarray:
+    """argmax over K of pdm + sign * lam * corr [ * 1(conf > gate) ]."""
+    corr, sign = corr_of(risk)
+    if conf is not None and gate > 0.0:
+        corr = corr * (conf > gate)
+    return np.argmax(pdm + sign * lam * corr, axis=1)
 
 
 def eval_sel(sel: np.ndarray, subscores: np.ndarray,
@@ -125,7 +144,8 @@ def eval_sel(sel: np.ndarray, subscores: np.ndarray,
     out = {}
     for name, keep in (("all", np.arange(S)),
                        ("conflict", np.flatnonzero(scene_subset))):
-        for metric, col in (("final", SUB_FINAL), ("NC", SUB_NC), ("TTC", SUB_TTC)):
+        for metric, col in (("final", SUB_FINAL), ("NC", SUB_NC),
+                            ("TTC", SUB_TTC), ("EP", SUB_EP)):
             vals = subscores[rows[keep], sel[keep], col]
             out[f"{metric}|{name}"] = bootstrap_scene_ci(vals, num_boot, seed)
     return out
@@ -148,21 +168,23 @@ def main() -> None:
 
     lam_table: List[List[str]] = []
     best: Dict[str, float] = {}
+    best_gated: Dict[str, Tuple[float, float]] = {}
     cv_data: Dict[str, dict] = {}  # variant -> aligned query_val arrays
     for rp in sorted(Path(args.val_risk_dir).glob("*.npz")):
         variant = rp.stem
         risk = load_npz(rp)
-        tok2idx = {t: i for i, t in enumerate(tr["tokens"])}
+        tok2idx = {t: i for i, t in enumerate(risk["tokens"])}
         keep = [tok2idx[t] for t in risk["tokens"] if t in tok2idx]
         sel_rows = np.asarray(keep)
         sel_rows = sel_rows[qva[sel_rows]]
         if len(sel_rows) == 0:
             continue
-        risk_s = risk["risk"][[list(risk["tokens"]).index(tr["tokens"][i])
-                               for i in sel_rows]]
+        ri = [list(risk["tokens"]).index(tr["tokens"][i]) for i in sel_rows]
+        risk_s = risk["risk"][ri]
+        conf_s = risk["conf"][ri] if "conf" in risk else None
         pdm_s = tr["pdm_score"][sel_rows]
         sub_s = tr["subscores"][sel_rows]
-        cv_data[variant] = {"rows": sel_rows, "risk": risk_s}
+        cv_data[variant] = {"rows": sel_rows, "risk": risk_s, "conf": conf_s}
         best_lam, best_val = 0.0, -np.inf
         for lam in args.lambdas:
             sel = select_with_risk(pdm_s, risk_s, lam)
@@ -173,6 +195,20 @@ def main() -> None:
         best[variant] = best_lam
         print(f"[rerank] {variant}: best lambda={best_lam:g} "
               f"(mean final {best_val:.4f} on {len(sel_rows)} scenes)")
+        if conf_s is not None:
+            bg, bgg = (0.0, 0.0), -np.inf
+            for lam in args.lambdas:
+                for g in args.gates:
+                    if g == 0.0:
+                        continue
+                    sel = select_with_risk(pdm_s, risk_s, lam, conf_s, g)
+                    m = float(sub_s[np.arange(len(sel)), sel,
+                                    SUB_FINAL].mean())
+                    if m > bgg:
+                        bgg, bg = m, (lam, g)
+            best_gated[variant] = bg
+            print(f"[rerank] {variant}: best gated "
+                  f"(lam={bg[0]:g}, g={bg[1]:g}) mean final {bgg:.4f}")
 
     # ---------------- query_val rerank: 5-fold CV across logs ---------------
     # per fold: lambda tuned on the other folds, applied to held-out scenes;
@@ -191,11 +227,13 @@ def main() -> None:
     def report_qva(name: str, sel: np.ndarray):
         res = eval_sel(sel, tr["subscores"][qva_rows], qva_subset,
                        args.num_boot, args.split_seed)
+        res["frac_changed"] = float((sel != qva_sel0).mean())
         cv_report[name] = res
-        for metric in ("final", "NC", "TTC"):
+        for metric in ("final", "NC", "TTC", "EP"):
             for sub in ("all", "conflict"):
                 qva_rows_report.append(
-                    [name, metric, sub, fmt_ci(*res[f"{metric}|{sub}"])])
+                    [name, metric, sub, fmt_ci(*res[f"{metric}|{sub}"]),
+                     f"{res['frac_changed']:.3f}"])
 
     report_qva("original_argmax", qva_sel0)
     report_qva("oracle_best",
@@ -204,27 +242,36 @@ def main() -> None:
         # map this variant's rows to positions inside qva_rows
         pos = np.array(
             [np.flatnonzero(qva_rows == r)[0] for r in d["rows"]])
-        sel = np.full(len(d["rows"]), -1)
-        for f in range(5):
-            trn = qva_fold[pos] != f
-            tst = ~trn
-            if not tst.any():
+        for gated in (False, True):
+            if gated and d["conf"] is None:
                 continue
-            bl, bv = 0.0, -np.inf
-            for lam in args.lambdas:
-                s_ = np.argmax(tr["pdm_score"][d["rows"][trn]] -
-                               lam * r_hat(d["risk"][trn]), axis=1)
-                m = float(tr["subscores"][d["rows"][trn], s_, SUB_FINAL].mean())
-                if m > bv:
-                    bv, bl = m, lam
-            sel[tst] = np.argmax(
-                tr["pdm_score"][d["rows"][tst]] -
-                bl * r_hat(d["risk"][tst]), axis=1)
-        # place the held-out selections back into a qva_rows-length vector,
-        # scenes without risk preds keep the original argmax
-        sel_full = qva_sel0.copy()
-        sel_full[pos] = sel
-        report_qva(f"{variant} (CV-lam)", sel_full)
+            sel = np.full(len(d["rows"]), -1)
+            for f in range(5):
+                trn = qva_fold[pos] != f
+                tst = ~trn
+                if not tst.any():
+                    continue
+                bl, bg_, bv = 0.0, 0.0, -np.inf
+                for lam in args.lambdas:
+                    glist = args.gates if gated else [0.0]
+                    for g in glist:
+                        s_ = select_with_risk(
+                            tr["pdm_score"][d["rows"][trn]],
+                            d["risk"][trn], lam,
+                            d["conf"][trn] if gated else None, g)
+                        m = float(tr["subscores"][
+                            d["rows"][trn], s_, SUB_FINAL].mean())
+                        if m > bv:
+                            bv, bl, bg_ = m, lam, g
+                sel[tst] = select_with_risk(
+                    tr["pdm_score"][d["rows"][tst]], d["risk"][tst], bl,
+                    d["conf"][tst] if gated else None, bg_)
+            # place the held-out selections back into a qva_rows-length
+            # vector; scenes without risk preds keep the original argmax
+            sel_full = qva_sel0.copy()
+            sel_full[pos] = sel
+            tag = "CV-lam,gated" if gated else "CV-lam"
+            report_qva(f"{variant} ({tag})", sel_full)
 
     # ---------------- apply to navtest --------------------------------------
     nt = scene_pack(Path(args.navtest_labels_dir), Path(args.navtest_export_dir),
@@ -243,11 +290,13 @@ def main() -> None:
     def report(name: str, sel: np.ndarray):
         res = eval_sel(sel, nt["subscores"], scene_subset, args.num_boot,
                        args.split_seed)
+        res["frac_changed"] = float((sel != sel0).mean())
         results[name] = res
-        for metric in ("final", "NC", "TTC"):
+        for metric in ("final", "NC", "TTC", "EP"):
             for sub in ("all", "conflict"):
                 rows_report.append([name, metric, sub,
-                                    fmt_ci(*res[f"{metric}|{sub}"])])
+                                    fmt_ci(*res[f"{metric}|{sub}"]),
+                                    f"{res['frac_changed']:.3f}"])
 
     report("original_argmax", sel0)
     oracle = np.argmax(nt["subscores"][..., SUB_FINAL], axis=1)
@@ -259,6 +308,7 @@ def main() -> None:
         tok2idx = {t: i for i, t in enumerate(risk["tokens"].tolist())}
         idx = np.array([tok2idx[t] for t in nt["tokens"] if t in tok2idx])
         keep = np.array([i for i, t in enumerate(nt["tokens"]) if t in tok2idx])
+        conf_nt = risk["conf"][idx] if "conf" in risk else None
         lam = best.get(variant, 1.0)
         sel = np.full(S, -1)
         sel[keep] = select_with_risk(nt["pdm_score"][keep],
@@ -266,6 +316,14 @@ def main() -> None:
         # scenes without risk predictions fall back to original argmax
         sel[sel < 0] = sel0[sel < 0]
         report(f"{variant} (lam={lam:g})", sel)
+        if variant in best_gated and conf_nt is not None:
+            lam_g, g = best_gated[variant]
+            sel = np.full(S, -1)
+            sel[keep] = select_with_risk(
+                nt["pdm_score"][keep], risk["risk"][idx], lam_g,
+                conf_nt, g)
+            sel[sel < 0] = sel0[sel < 0]
+            report(f"{variant} gated (lam={lam_g:g},g={g:g})", sel)
 
     md = ["# Re-ranking evaluation (Stage 4)", ""]
     md.append(f"navtest scenes: {S} | lambda tuned on navtrain query_val "
@@ -280,14 +338,14 @@ def main() -> None:
     md.append("")
     md.append("## query_val re-ranking (5-fold CV over logs, "
               f"{len(qva_rows)} scenes)")
-    md.append("| selector | metric | subset | value [95% CI] |")
-    md.append("|---|---|---|---|")
+    md.append("| selector | metric | subset | value [95% CI] | frac_changed |")
+    md.append("|---|---|---|---|---|")
     for r in qva_rows_report:
         md.append("| " + " | ".join(r) + " |")
     md.append("")
     md.append("## navtest selected-candidate outcomes (labelled subscores)")
-    md.append("| selector | metric | subset | value [95% CI] |")
-    md.append("|---|---|---|---|")
+    md.append("| selector | metric | subset | value [95% CI] | frac_changed |")
+    md.append("|---|---|---|---|---|")
     for r in rows_report:
         md.append("| " + " | ".join(r) + " |")
     md.append("")
@@ -298,9 +356,15 @@ def main() -> None:
     (out_dir / "rerank_results.md").write_text("\n".join(md) + "\n")
     with open(out_dir / "rerank_results.json", "w") as f:
         json.dump({"best_lambda": best,
-                   "query_val_cv": {k: {m: list(v) for m, v in res.items()
+                   "best_gated": {k: list(v)
+                                  for k, v in best_gated.items()},
+                   "query_val_cv": {k: {m: (list(v) if isinstance(v, tuple)
+                                            else v)
+                                        for m, v in res.items()
                                         } for k, res in cv_report.items()},
-                   "results": {k: {m: list(v) for m, v in res.items()
+                   "results": {k: {m: (list(v) if isinstance(v, tuple)
+                                       else v)
+                                   for m, v in res.items()
                                    } for k, res in results.items()}},
                   f, indent=2)
     print(f"[rerank] done -> {out_dir}")
