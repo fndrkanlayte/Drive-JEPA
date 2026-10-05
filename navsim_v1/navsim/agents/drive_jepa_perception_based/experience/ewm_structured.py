@@ -102,18 +102,36 @@ class B1Aux(_Trunk):
                 "slot_logit": aux[..., N_AGENT_F]}
 
 
+FUT_GRID = (16, 32)   # Drive-JEPA image_feature token grid
+FUT_POOL = (4, 4)     # -> 4x8 = 32 target tokens
+
+
+def future_target(image_future: torch.Tensor) -> torch.Tensor:
+    """Frozen JEPA feature of o_{t+H}, avg-pooled to 32 tokens and layer-normed (no params).
+
+    Using the frozen encoder output (as in V-JEPA 2-AC) instead of an EMA of our own trainable
+    SceneEncoder removes the collapse/drift path of a moving target."""
+    B, N, D = image_future.shape
+    g = image_future.float().transpose(1, 2).reshape(B, D, *FUT_GRID)
+    g = F.avg_pool2d(g, FUT_POOL).flatten(2).transpose(1, 2)            # (B,32,D)
+    return F.layer_norm(g, (D,))
+
+
 class FuturePredictor(nn.Module):
-    """P_f(z_t, tau*) -> z_hat_{t+H} (B, Q, D)."""
+    """P_f(z_t, tau*) -> z_hat_{t+H} (B, 32, D) in the frozen JEPA feature space."""
 
     def __init__(self, d_model: int = D_SCENE, n_layers: int = 2) -> None:
         super().__init__()
+        n_tok = (FUT_GRID[0] // FUT_POOL[0]) * (FUT_GRID[1] // FUT_POOL[1])
+        self.queries = nn.Parameter(torch.randn(n_tok, d_model) * 0.02)
         self.layers = nn.ModuleList(PredictorLayer(d_model) for _ in range(n_layers))
         self.out = nn.Linear(d_model, d_model)
 
     def forward(self, z: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
-        q = z + act.unsqueeze(1)
+        q = self.queries.unsqueeze(0) + act.unsqueeze(1)
+        mem = torch.cat([z, act.unsqueeze(1)], dim=1)
         for layer in self.layers:
-            q = layer(q, torch.cat([z, act.unsqueeze(1)], dim=1))
+            q = layer(q, mem)
         return self.out(q)
 
 
@@ -140,13 +158,10 @@ class EWMStructured(_Trunk):
         if use_future:
             self.expert_token = nn.Parameter(torch.zeros(d_model))
             self.fut = FuturePredictor(d_model)
-            self.scene_ema = _frozen_copy(self.scene)
 
     @torch.no_grad()
     def update_ema(self, m: float = 0.996) -> None:
         pairs = [(self.enc_agent_ema, self.enc_agent), (self.enc_ego_ema, self.enc_ego)]
-        if self.use_future:
-            pairs.append((self.scene_ema, self.scene))
         for tgt, src in pairs:
             for pe, pl in zip(tgt.parameters(), src.parameters()):
                 pe.mul_(m).add_(pl, alpha=1.0 - m)
@@ -178,7 +193,7 @@ class EWMStructured(_Trunk):
         act = self.action.proj(torch.cat([self.expert_token.expand(act.shape[0], -1), act], -1))
         z_hat = self.fut(z, act)
         with torch.no_grad():
-            z_tgt = self.scene_ema(image_future)
+            z_tgt = future_target(image_future)
         per = F.mse_loss(z_hat, z_tgt, reduction="none").mean((1, 2))
         return (per * has_future).sum() / has_future.sum().clamp_min(1.0)
 
