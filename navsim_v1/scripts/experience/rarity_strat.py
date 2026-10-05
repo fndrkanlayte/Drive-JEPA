@@ -58,6 +58,9 @@ def parse_args():
     p.add_argument("--navtest_export_dir", required=True)
     p.add_argument("--navtest_risk_dir", required=True)
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--rarity_npz", default=None,
+                   help="reuse precomputed rarity.npz (tokens + rarity) "
+                        "instead of recomputing scene features")
     p.add_argument("--num_boot", type=int, default=1000)
     p.add_argument("--split_seed", type=int, default=0)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
@@ -118,23 +121,27 @@ def main() -> None:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[rarity] loading navtrain feats", flush=True)
-    m_feats, _, m_logs = scene_feats(Path(args.export_dir),
-                                     Path(args.labels_dir))
-    print(f"[rarity] navtrain scenes: {len(m_feats)}")
-
     print("[rarity] loading navtest feats + labels", flush=True)
     nt = fr.scene_pack(Path(args.navtest_labels_dir),
                        Path(args.navtest_export_dir), args.dt_enter_thresh)
-    q_feats, q_tokens, q_logs = scene_feats(
-        Path(args.navtest_export_dir), Path(args.navtest_labels_dir))
-    # align q_feats to nt token order
-    t2i = {t: i for i, t in enumerate(q_tokens)}
-    q_feats = q_feats[[t2i[t] for t in nt["tokens"]]]
-    q_logs = q_logs[[t2i[t] for t in nt["tokens"]]]
-
-    print("[rarity] scoring rarity", flush=True)
-    rare = rarity_scores(q_feats, q_logs, m_feats, m_logs, args.device)
+    if args.rarity_npz:
+        rz = np.load(args.rarity_npz, allow_pickle=True)
+        t2r = {t: i for i, t in enumerate(rz["tokens"].tolist())}
+        rare = np.asarray(rz["rarity"])[
+            [t2r[t] for t in nt["tokens"]]]
+        print(f"[rarity] reused rarity scores from {args.rarity_npz}")
+    else:
+        print("[rarity] loading navtrain feats", flush=True)
+        m_feats, _, m_logs = scene_feats(Path(args.export_dir),
+                                         Path(args.labels_dir))
+        print(f"[rarity] navtrain scenes: {len(m_feats)}")
+        q_feats, q_tokens, q_logs = scene_feats(
+            Path(args.navtest_export_dir), Path(args.navtest_labels_dir))
+        t2i = {t: i for i, t in enumerate(q_tokens)}
+        q_feats = q_feats[[t2i[t] for t in nt["tokens"]]]
+        q_logs = q_logs[[t2i[t] for t in nt["tokens"]]]
+        print("[rarity] scoring rarity", flush=True)
+        rare = rarity_scores(q_feats, q_logs, m_feats, m_logs, args.device)
     dec = np.quantile(rare, np.linspace(0, 1, 11))
 
     S = len(nt["tokens"])
