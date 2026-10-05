@@ -13,6 +13,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (
     N_SLOTS,
     N_SUB,
     make_memory_tokens,
+    pairwise_hinge,
     retrieval_kl,
     score_with_delta,
 )
@@ -207,6 +208,22 @@ def test_pad_mask_full_row_gives_zero_delta():
     d = delta(a, yh, mem, pad_mask=pad)
     assert torch.isfinite(d).all()
     assert torch.allclose(d, torch.zeros_like(d))
+
+
+def test_hinge_prefers_better_final():
+    """Scores aligned with true final must lower the loss; inverted scores
+    must raise it (hinge direction regression test)."""
+    final = torch.tensor([[0.9, 0.5, 0.2]])            # cand 0 best
+    good = final * 0.1 + 0.5                            # aligned, sub-margin gaps
+    bad = -final
+    l_good = pairwise_hinge(good, final)
+    l_bad = pairwise_hinge(bad, final)
+    assert l_good < l_bad
+    # raising the best candidate's score must decrease the loss
+    l_up = pairwise_hinge(good + torch.tensor([[0.5, 0., 0.]]), final)
+    # raising a worse candidate's score must increase the loss
+    l_down = pairwise_hinge(good + torch.tensor([[0., 0., 0.5]]), final)
+    assert l_up < l_good < l_down
 
 
 def test_retrieval_kl_runs():

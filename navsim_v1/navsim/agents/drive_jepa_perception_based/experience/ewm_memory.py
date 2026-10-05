@@ -183,7 +183,7 @@ def pairwise_hinge(scores: torch.Tensor, final: torch.Tensor,
     cnt = 0
     for b in range(B):
         f, s = final[b], scores[b]
-        hi = f[None, :] - f[:, None] > gap          # (K,K) better row = i
+        hi = f[:, None] - f[None, :] > gap          # (K,K) True where f_i > f_j
         if not hi.any():
             continue
         diffs = s[:, None] - s[None, :]             # want s_i > s_j when f_i>f_j

@@ -212,6 +212,7 @@ def main():
     p.add_argument("--lam_ret", type=float, default=1.0)
     p.add_argument("--lam_hinge", type=float, default=1.0)
     p.add_argument("--lam_c", type=float, default=1.0)
+    p.add_argument("--lam_dreg", type=float, default=0.01)
     p.add_argument("--k", type=int, default=K_RETR)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_scenes", type=int, default=None)
@@ -327,7 +328,10 @@ def main():
 
                 lce = listwise_ce(scores, final, weight=hw)
                 lhinge = pairwise_hinge(scores, final, weight=hw)
-                lmain = lce + args.lam_hinge * lhinge
+                # delta regulariser: penalise within-scene demeaned delta spread
+                ldr = (dl - dl.mean(1, keepdim=True)).pow(2).mean()
+                lmain = (lce + args.lam_hinge * lhinge
+                         + args.lam_dreg * ldr)
 
                 # memory-dependence constraint: deranged neighbours
                 # (same 'wrong memory' semantics as eval shuffle arm)
