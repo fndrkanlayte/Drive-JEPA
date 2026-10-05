@@ -70,6 +70,11 @@ def parse_args():
     p.add_argument("--mem_logs_file", default=None,
                    help="json list of log names forming the memory bank "
                         "(Q7 held-out protocol); overrides the memory split")
+    p.add_argument("--mem_c_frac", type=float, default=None,
+                   help="Q10: keep only this fraction of C candidates in the "
+                        "memory bank (0 = memory without C; 1 = all C kept; "
+                        "ignored when unset = legacy full memory). "
+                        "Combinable with --fractions/--mem_logs_file.")
     p.add_argument("--device",
                    default="cuda" if __import__("torch").cuda.is_available()
                    else "cpu")
@@ -103,6 +108,16 @@ def main() -> None:
               f"{int(mem_mask.sum())} candidates")
     else:
         mem_mask = np.isin(rows["log"], list(groups["memory"]))
+    if args.mem_c_frac is not None:
+        c = te.c_mask(rows)
+        c_mem = np.flatnonzero(mem_mask & c)
+        rng_c = np.random.default_rng(args.split_seed + 997)
+        keep_c = rng_c.random(len(c_mem)) < args.mem_c_frac
+        mem_mask = (mem_mask & ~c).copy()
+        mem_mask[c_mem[keep_c]] = True
+        print(f"[mem] C-candidates: {len(c_mem)} in mem logs, "
+              f"kept {int(keep_c.sum())} (frac={args.mem_c_frac}); "
+              f"memory rows: {int(mem_mask.sum())}")
     # desc standardization: prefer stats stored in the checkpoint (they were
     # fit on the model's own training logs, e.g. the A half in Q7)
     meta_probe = torch.load(

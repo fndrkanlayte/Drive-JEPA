@@ -128,6 +128,11 @@ def parse_args():
                    help="json list of log names; restrict all rows to these "
                         "logs BEFORE the memory/query split (Q7 held-out "
                         "protocol: train on half A only)")
+    p.add_argument("--drop_c", action="store_true",
+                   help="Q10 held-out long-tail: drop every C candidate "
+                        "(noatt main desc: conflict=1, |dt_enter|<2s, "
+                        "itype in {CROSSING,ONCOMING}) from ALL rows before "
+                        "the memory/query split; scenes are kept")
     p.add_argument("--task", choices=["risk", "residual"], default="risk",
                    help="risk: BCE on nc_unsafe/ttc_bad. residual: Huber "
                         "regression on y_res = labelled final - pdm_score "
@@ -139,6 +144,19 @@ def parse_args():
     p.add_argument("--device",
                    default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     return p.parse_args()
+
+
+def c_mask(rows: Dict[str, np.ndarray]) -> np.ndarray:
+    """Boolean (N,) -- candidate's noatt main desc is a C interaction:
+    conflict=1 AND |dt_enter|<2s AND itype in {CROSSING, ONCOMING}.
+    Reads aux columns [conflict, itype, dt_enter] with aux_mask.
+    """
+    aux, m = rows["aux"], rows["aux_mask"]
+    return (
+        m[:, 0] & (aux[:, 0] > 0.5)
+        & m[:, 1] & np.isin(aux[:, 1].astype(np.int64), [2, 3])
+        & m[:, 2] & (np.abs(aux[:, 2]) < 2.0)
+    )
 
 
 def load_rows(labels_dir: Path, export_dir: Path,
@@ -519,6 +537,16 @@ def main() -> None:
         n_scenes = int(len(np.unique(rows["scene_id"])))
         print(f"[exp] restricted to {len(allowed)} logs from "
               f"{args.allowed_logs_file}")
+    if args.drop_c:
+        c = c_mask(rows)
+        rows = {k: (v[~c] if isinstance(v, np.ndarray)
+                    and v.ndim >= 1 and v.shape[0] == c.shape[0]
+                    else v) for k, v in rows.items()}
+        n_scenes = int(len(np.unique(rows["scene_id"])))
+        print(f"[exp] dropped {int(c.sum())} C candidates "
+              f"(kept {n_scenes} scenes)")
+
+
     print(f"[exp] {n_scenes} scenes, {len(rows['y'])} candidates")
     residual = args.task == "residual"
     if residual:
