@@ -43,6 +43,8 @@ RISK_VARIANT = "noexp_int"          # best ungated risk variant
 RISK_LAM = 0.5
 FUSION_VARIANT = "pred_desc_retrieval_pp"  # best Q5b on navtest
 FUSION_ALPHA, FUSION_REGION, FUSION_EPS = 0.2, ("topk", 2.0), 0.05
+RAND_VARIANT = "random"             # Q5b control
+RAND_ALPHA, RAND_REGION, RAND_EPS = 0.2, ("margin", 0.005), 0.0
 KNN = 10
 
 
@@ -153,7 +155,16 @@ def main() -> None:
     sel_fus[keep] = fr.fused_select(
         nt["pred_logit"][keep], risk["risk"][idx], FUSION_ALPHA,
         nt["pdm_score"][keep], FUSION_REGION, FUSION_EPS, sel0[keep])
+    sel_rand = sel0.copy()
+    risk_r = load_npz(Path(args.navtest_risk_dir) / f"{RAND_VARIANT}.npz")
+    t2rr = {t: i for i, t in enumerate(risk_r["tokens"].tolist())}
+    idx_r = np.array([t2rr[t] for t in nt["tokens"] if t in t2rr])
+    keep_r = np.array([i for i, t in enumerate(nt["tokens"]) if t in t2rr])
+    sel_rand[keep_r] = fr.fused_select(
+        nt["pred_logit"][keep_r], risk_r["risk"][idx_r], RAND_ALPHA,
+        nt["pdm_score"][keep_r], RAND_REGION, RAND_EPS, sel0[keep_r])
     selectors = [("original_argmax", sel0),
+                 (f"{RAND_VARIANT}(Q5b control)", sel_rand),
                  (f"{RISK_VARIANT}(lam={RISK_LAM})", sel_risk),
                  (f"{FUSION_VARIANT}(Q5b)", sel_fus)]
 
