@@ -148,6 +148,7 @@ def main() -> None:
 
     lam_table: List[List[str]] = []
     best: Dict[str, float] = {}
+    cv_data: Dict[str, dict] = {}  # variant -> aligned query_val arrays
     for rp in sorted(Path(args.val_risk_dir).glob("*.npz")):
         variant = rp.stem
         risk = load_npz(rp)
@@ -161,6 +162,7 @@ def main() -> None:
                                for i in sel_rows]]
         pdm_s = tr["pdm_score"][sel_rows]
         sub_s = tr["subscores"][sel_rows]
+        cv_data[variant] = {"rows": sel_rows, "risk": risk_s}
         best_lam, best_val = 0.0, -np.inf
         for lam in args.lambdas:
             sel = select_with_risk(pdm_s, risk_s, lam)
@@ -171,6 +173,58 @@ def main() -> None:
         best[variant] = best_lam
         print(f"[rerank] {variant}: best lambda={best_lam:g} "
               f"(mean final {best_val:.4f} on {len(sel_rows)} scenes)")
+
+    # ---------------- query_val rerank: 5-fold CV across logs ---------------
+    # per fold: lambda tuned on the other folds, applied to held-out scenes;
+    # all held-out selections are pooled for the report (no tuning leakage).
+    qva_rows = np.flatnonzero(qva)
+    qva_sel0 = np.argmax(tr["pdm_score"][qva_rows], axis=1)
+    qva_subset = tr["subset"][qva_rows][np.arange(len(qva_rows)), qva_sel0]
+    u_logs = np.unique(tr["logs"][qva_rows])
+    fold_of = {l: i % 5 for i, l in enumerate(
+        np.random.default_rng(args.split_seed).permutation(u_logs))}
+    qva_fold = np.array([fold_of[l] for l in tr["logs"][qva_rows]])
+
+    cv_report: Dict[str, dict] = {}
+    qva_rows_report: List[List[str]] = []
+
+    def report_qva(name: str, sel: np.ndarray):
+        res = eval_sel(sel, tr["subscores"][qva_rows], qva_subset,
+                       args.num_boot, args.split_seed)
+        cv_report[name] = res
+        for metric in ("final", "NC", "TTC"):
+            for sub in ("all", "conflict"):
+                qva_rows_report.append(
+                    [name, metric, sub, fmt_ci(*res[f"{metric}|{sub}"])])
+
+    report_qva("original_argmax", qva_sel0)
+    report_qva("oracle_best",
+               np.argmax(tr["subscores"][qva_rows][..., SUB_FINAL], axis=1))
+    for variant, d in sorted(cv_data.items()):
+        # map this variant's rows to positions inside qva_rows
+        pos = np.array(
+            [np.flatnonzero(qva_rows == r)[0] for r in d["rows"]])
+        sel = np.full(len(d["rows"]), -1)
+        for f in range(5):
+            trn = qva_fold[pos] != f
+            tst = ~trn
+            if not tst.any():
+                continue
+            bl, bv = 0.0, -np.inf
+            for lam in args.lambdas:
+                s_ = np.argmax(tr["pdm_score"][d["rows"][trn]] -
+                               lam * r_hat(d["risk"][trn]), axis=1)
+                m = float(tr["subscores"][d["rows"][trn], s_, SUB_FINAL].mean())
+                if m > bv:
+                    bv, bl = m, lam
+            sel[tst] = np.argmax(
+                tr["pdm_score"][d["rows"][tst]] -
+                bl * r_hat(d["risk"][tst]), axis=1)
+        # place the held-out selections back into a qva_rows-length vector,
+        # scenes without risk preds keep the original argmax
+        sel_full = qva_sel0.copy()
+        sel_full[pos] = sel
+        report_qva(f"{variant} (CV-lam)", sel_full)
 
     # ---------------- apply to navtest --------------------------------------
     nt = scene_pack(Path(args.navtest_labels_dir), Path(args.navtest_export_dir),
@@ -224,18 +278,28 @@ def main() -> None:
     for r in lam_table:
         md.append("| " + " | ".join(r) + " |")
     md.append("")
+    md.append("## query_val re-ranking (5-fold CV over logs, "
+              f"{len(qva_rows)} scenes)")
+    md.append("| selector | metric | subset | value [95% CI] |")
+    md.append("|---|---|---|---|")
+    for r in qva_rows_report:
+        md.append("| " + " | ".join(r) + " |")
+    md.append("")
     md.append("## navtest selected-candidate outcomes (labelled subscores)")
     md.append("| selector | metric | subset | value [95% CI] |")
     md.append("|---|---|---|---|")
     for r in rows_report:
         md.append("| " + " | ".join(r) + " |")
     md.append("")
-    md.append("Note: official run_pdm_score not applied to re-ranked "
-              "trajectories (would need an agent wrapper replaying selections); "
-              "metrics are labelled subscores of the selected candidate.")
+    md.append("Note: metrics are labelled subscores of the selected "
+              "candidate. For official PDMS of a re-ranked policy use "
+              "scripts/experience/export_selections.py + run_pdm_score with "
+              "agent=replay_selection_agent.")
     (out_dir / "rerank_results.md").write_text("\n".join(md) + "\n")
     with open(out_dir / "rerank_results.json", "w") as f:
         json.dump({"best_lambda": best,
+                   "query_val_cv": {k: {m: list(v) for m, v in res.items()
+                                        } for k, res in cv_report.items()},
                    "results": {k: {m: list(v) for m, v in res.items()
                                    } for k, res in results.items()}},
                   f, indent=2)
