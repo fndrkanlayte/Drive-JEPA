@@ -227,6 +227,24 @@ def test_hinge_prefers_better_final():
     assert l_up < l_good < l_down
 
 
+def test_lc_sg_blocks_grad_to_shuffled_branch():
+    # lc = relu(mu - (l_s - l_ref)): with l_s detached the shuffled
+    # branch must receive zero gradient through lc
+    l_ref = torch.tensor(0.0, requires_grad=True)
+    dl_s = (torch.randn(8) * 0.1).requires_grad_(True)
+    l_s = dl_s.pow(2).mean()
+    mu = 0.5
+    lc = torch.relu(mu - (l_s - l_ref))
+    lc.backward()
+    g_nosg = dl_s.grad.clone()
+    assert g_nosg.abs().sum() > 0
+    dl_s2 = dl_s.detach().clone().requires_grad_(True)
+    l_s2 = dl_s2.pow(2).mean().detach()
+    lc2 = torch.relu(mu - (l_s2 - l_ref))
+    lc2.backward()
+    assert dl_s2.grad is None
+
+
 def test_delta_cap_bounds_and_zero_init():
     cap = 0.5
     delta = MemoryDelta(delta_cap=cap)

@@ -227,6 +227,8 @@ def main():
     p.add_argument("--lam_keep", type=float, default=1.0)
     p.add_argument("--keep_tol", type=float, default=0.005,
                    help="lkeep covers candidates with final < f_b0 - keep_tol")
+    p.add_argument("--lc_sg", action="store_true",
+                   help="stop-gradient on shuffled-memory branch of L_c")
     p.add_argument("--eval_half", action="store_true",
                    help="run val eval twice per epoch (half and end)")
     p.add_argument("--k", type=int, default=K_RETR)
@@ -452,6 +454,8 @@ def main():
                     else:
                         l_s = listwise_ce(sc_s, final, weight=hw)
                         l_ref = lce
+                    if args.lc_sg:
+                        l_s = l_s.detach()
                     lc = F.relu(args.mu - (l_s - l_ref))
                     lmain = lmain + args.lam_c * lc
 
