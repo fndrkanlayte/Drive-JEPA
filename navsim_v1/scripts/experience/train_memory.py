@@ -477,9 +477,10 @@ def main():
             loss = lmain + args.lam_ret * lret
             opt.zero_grad()
             loss.backward()
-            if args.grad_clip > 0:
-                gn = torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-                ep_gn += float(gn)
+            gn = torch.nn.utils.clip_grad_norm_(
+                params, args.grad_clip if args.grad_clip > 0
+                else float("inf"))
+            ep_gn += float(gn)
             opt.step()
             ep_loss += float(loss); ep_ret += float(lret)
             ep_c += float(lc); ep_main += float(lce)
