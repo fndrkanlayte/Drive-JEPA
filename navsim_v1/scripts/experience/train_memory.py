@@ -85,12 +85,13 @@ def collate_cache(batch):
 
 
 def build_bank(ds: CacheDataset, keynet, device) -> MemoryBank:
-    z_pool, key, yt, sub, b0, traj, logs = [], [], [], [], [], [], []
+    z_pool, key, yt, yh, sub, b0, traj, logs = [], [], [], [], [], [], [], []
     for b in DataLoader(ds, batch_size=64, shuffle=False, num_workers=4,
                         collate_fn=collate_cache):
         z_pool.append(b["z_pool"].numpy())
         key.append(b["key_src"].numpy())
         yt.append(b["yt"].numpy())
+        yh.append(b["yhat"].numpy())
         sub.append(b["sub"].numpy())
         b0.append(b["b0"].numpy())
         traj.append(b["traj"].numpy())
@@ -98,7 +99,9 @@ def build_bank(ds: CacheDataset, keynet, device) -> MemoryBank:
     bank = MemoryBank(np.concatenate(key), np.concatenate(z_pool), logs,
                       np.concatenate(yt).reshape(len(logs), -1, 5 * 64),
                       np.concatenate(sub), np.concatenate(b0),
-                      np.concatenate(traj))
+                      np.concatenate(traj),
+                      yhat_flat=np.concatenate(yh).reshape(len(logs), -1,
+                                                         5 * 64))
     if keynet is not None:
         with torch.no_grad():
             ks = torch.from_numpy(bank.key_src).to(device)
@@ -138,7 +141,8 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
         bank = MemoryBank(bank.key_src[keep], bank.z_pool[keep],
                           bank.logs[keep], bank.yt_flat[keep],
                           bank.sub[keep], bank.b0[keep], bank.traj[keep],
-                          bank.g_keys[keep] if bank.g_keys is not None else None)
+                          bank.g_keys[keep] if bank.g_keys is not None else None,
+                          yhat_flat=bank.yhat_flat[keep])
 
     if key_mode == "lret":
         with torch.no_grad():

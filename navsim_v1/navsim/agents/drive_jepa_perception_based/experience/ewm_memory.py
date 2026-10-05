@@ -70,25 +70,28 @@ class TrajEnc(nn.Module):
 
 
 class MemTokenEnc(nn.Module):
-    """m_ij = MLP([z_pool(256), Enc(tau)(64), y_t flat(320), s(6), b0(1)]) -> 256.
-    no_latent=True drops the y_t block (appearance+trajectory+scores only)."""
+    """m_ij = MLP([z_pool(256), Enc(tau)(64), yhat flat(320), y_t flat(320),
+    s(6), b0(1)]) -> 256.  yhat = b3's prediction for that memory candidate,
+    y_t = actual encoded outcome: the 'predicted vs actual' contrast.
+    no_latent=True drops BOTH latent blocks (appearance+traj+scores only)."""
 
     def __init__(self, d: int = D_SCENE, no_latent: bool = False):
         super().__init__()
         self.no_latent = no_latent
         self.traj = TrajEnc()
-        in_dim = D_SCENE + 64 + N_SUB + 1 + (0 if no_latent else N_SLOTS * D_LAT)
+        in_dim = D_SCENE + 64 + N_SUB + 1 + (0 if no_latent else 2 * N_SLOTS * D_LAT)
         self.proj = nn.Sequential(nn.Linear(in_dim, d),
                                   nn.GELU(), nn.Linear(d, d))
 
     def forward(self, z_pool: torch.Tensor, traj: torch.Tensor,
-                y_t: torch.Tensor, s: torch.Tensor,
+                y_t: torch.Tensor, yhat: torch.Tensor, s: torch.Tensor,
                 b0: torch.Tensor) -> torch.Tensor:
-        """z_pool (...,256); traj (...,8,3); y_t (...,5,64); s (...,6); b0 (...,)"""
+        """z_pool (...,256); traj (...,8,3); y_t (...,5,64);
+        yhat (...,5,64); s (...,6); b0 (...,)"""
         t = self.traj(traj)
         parts = [z_pool, t]
         if not self.no_latent:
-            parts.append(y_t.flatten(-2))
+            parts += [yhat.flatten(-2), y_t.flatten(-2)]
         parts += [s, b0.unsqueeze(-1)]
         return self.proj(torch.cat(parts, dim=-1))
 
@@ -216,7 +219,7 @@ class MemoryBank:
     """
 
     def __init__(self, key_src, z_pool, logs, yt_flat, sub, b0, traj,
-                 g_keys=None):
+                 g_keys=None, yhat_flat=None):
         self.key_src = key_src.astype(np.float32)
         self.z_pool = z_pool.astype(np.float32)
         self.logs = np.asarray(logs)
@@ -225,6 +228,12 @@ class MemoryBank:
         self.b0 = b0.astype(np.float32)
         self.traj = traj.astype(np.float32)
         self.g_keys = g_keys.astype(np.float32) if g_keys is not None else None
+        # (S,K,320) b3 predictions for each bank candidate; falls back to
+        # zeros when absent (e.g. a bank built without them)
+        self.yhat_flat = (yhat_flat.astype(np.float32)
+                          if yhat_flat is not None
+                          else np.zeros((len(logs), self.sub.shape[1],
+                                         N_SLOTS * D_LAT), np.float32))
         self.app = self.key_src[:, :D_SCENE]            # appearance part
         self.app_n = self.app / (np.linalg.norm(self.app, axis=1,
                                                 keepdims=True) + 1e-8)
@@ -292,6 +301,7 @@ class MemoryBank:
         g = dict(
             z_pool=self.z_pool[idx],                    # (B,k,256)
             yt_flat=self.yt_flat[idx],                  # (B,k,K,320)
+            yhat_flat=self.yhat_flat[idx],              # (B,k,K,320)
             sub=self.sub[idx],                          # (B,k,K,6)
             b0=self.b0[idx],                            # (B,k,K)
             traj=self.traj[idx],                        # (B,k,K,8,3)
@@ -310,9 +320,11 @@ def make_memory_tokens(enc: MemTokenEnc, gathered: Dict[str, np.ndarray],
     t = torch.from_numpy(gathered["traj"]).to(device)
     yt = torch.from_numpy(gathered["yt_flat"]).to(device)
     yt = yt.reshape(B, k, K, N_SLOTS, D_LAT)
+    yh = torch.from_numpy(gathered["yhat_flat"]).to(device)
+    yh = yh.reshape(B, k, K, N_SLOTS, D_LAT)
     s = torch.from_numpy(gathered["sub"]).to(device)
     b0 = torch.from_numpy(gathered["b0"]).to(device)
-    tok = enc(z, t, yt, s, b0)                          # (B,k,K,256)
+    tok = enc(z, t, yt, yh, s, b0)                      # (B,k,K,256)
     return tok.reshape(B, k * K, -1)
 
 
