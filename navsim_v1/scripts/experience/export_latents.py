@@ -41,6 +41,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -75,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token_list", type=str, default=None,
                    help="optional file with one token per line")
     p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--io_workers", type=int, default=8,
+                   help="threads preparing scenes (decode/features) per export proc")
     return p.parse_args()
 
 
@@ -297,13 +300,61 @@ def main() -> None:
                 feats, metas = [], []
 
         consec_fail = 0
-        for token in tqdm(tokens, desc="export(scenes)"):
+        prof = {"load": 0.0, "input": 0.0, "feat": 0.0, "fwd": 0.0, "n": 0}
+        t_loop_start = time.time()
+
+        def prepare(token):
+            """IO/CPU stage (runs in worker threads): scene -> agent_input ->
+            CPU features. GPU forward stays on the main thread."""
+            scene = scene_loader.get_scene_from_token(token)
+            log_name = scene.scene_metadata.log_name
+            if scene_done(token, log_name):
+                return ("done", token, log_name, None, None)
+            agent_input = scene.get_agent_input()
+            f: Dict[str, torch.Tensor] = {}
+            for b in feature_builders:
+                f.update(b.compute_features(agent_input))
+            meta = {"token": token, "log_name": log_name}
             try:
-                scene = scene_loader.get_scene_from_token(token)
-                log_name = scene.scene_metadata.log_name
-                if scene_done(token, log_name):
+                meta["trajectory"] = scene.get_future_trajectory(
+                    num_trajectory_frames=config.num_poses
+                ).poses
+            except Exception:
+                pass
+            return ("ok", token, log_name, f, meta)
+
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        n_io = args.io_workers
+        print(f"[export] io_workers={n_io} batch={args.batch_size}", flush=True)
+        pool = ThreadPoolExecutor(max_workers=n_io)
+        pending = deque()           # (future, token) in submission order
+        tok_iter = iter(tokens)
+        exhausted = False
+        pbar = tqdm(total=len(tokens), desc="export(scenes)")
+        max_pending = max(2 * args.batch_size, n_io * 2)
+
+        def fill():
+            nonlocal exhausted
+            while not exhausted and len(pending) < max_pending:
+                try:
+                    t = next(tok_iter)
+                except StopIteration:
+                    exhausted = True
+                    break
+                pending.append((pool.submit(prepare, t), t))
+
+        fill()
+        while pending:
+            fu, token = pending.popleft()
+            _t = time.time()
+            try:
+                status, token, log_name, f, meta = fu.result()
+                if status == "done":
+                    pbar.update(1)
+                    fill()
                     continue
-                agent_input = scene.get_agent_input()
             except Exception as e:
                 n_skipped += 1
                 skipped_tokens.append((token, str(e)[:120]))
@@ -315,23 +366,38 @@ def main() -> None:
                         f"not sparse missing frames"
                     )
                 print(f"[export] WARNING: skipping {token}: {e}")
+                pbar.update(1)
+                fill()
                 continue
             consec_fail = 0
-            f: Dict[str, torch.Tensor] = {}
-            for b in feature_builders:
-                f.update(b.compute_features(agent_input))
-            meta = {"token": token, "log_name": log_name}
-            try:
-                meta["trajectory"] = scene.get_future_trajectory(
-                    num_trajectory_frames=config.num_poses
-                ).poses
-            except Exception:
-                pass
+            prof["input"] += time.time() - _t
             feats.append(f)
             metas.append(meta)
             if len(feats) >= args.batch_size:
+                _t = time.time()
                 flush()
+                torch.cuda.synchronize() if device.type == "cuda" else None
+                prof["fwd"] += time.time() - _t
+            prof["n"] += 1
+            pbar.update(1)
+            fill()
+            if prof["n"] % 100 == 0:
+                print(
+                    f"[profile] n={prof['n']} wall={(time.time() - t_loop_start) / prof['n']:.3f}s/scene "
+                    f"wait={prof['input'] / prof['n']:.3f}s fwd={prof['fwd'] / prof['n']:.3f}s",
+                    flush=True,
+                )
+        pool.shutdown(wait=True)
+        _t = time.time()
         flush()
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        prof["fwd"] += time.time() - _t
+        if prof["n"]:
+            print(
+                f"[profile] FINAL n={prof['n']} wall={(time.time() - t_loop_start) / prof['n']:.3f}s/scene "
+                f"wait={prof['input'] / prof['n']:.3f}s fwd={prof['fwd'] / prof['n']:.3f}s",
+                flush=True,
+            )
 
     manifest = out_dir / "manifest.csv"
     fieldnames = ["token", "log_name", "file", "selected_idx", "pdm_selected", "max_pdm_score"]
