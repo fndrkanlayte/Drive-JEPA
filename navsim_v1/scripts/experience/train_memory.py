@@ -215,6 +215,10 @@ def main():
     p.add_argument("--lam_dreg", type=float, default=0.01)
     p.add_argument("--delta_cap", type=float, default=1.0,
                    help="tanh cap on delta magnitude; <=0 disables")
+    p.add_argument("--mu", type=float, default=MU,
+                   help="memory-dependence margin for L_c")
+    p.add_argument("--hard_w", type=float, default=HARD_W,
+                   help="loss weight for hard (B0-wrong) scenes")
     p.add_argument("--k", type=int, default=K_RETR)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_scenes", type=int, default=None)
@@ -326,7 +330,7 @@ def main():
                 f_best = final.max(1).values
                 f_b0 = final.gather(1, b0_pick[:, None].to(device)).squeeze(1)
                 hw = torch.where(f_b0 < f_best - 0.05,
-                                 torch.tensor(HARD_W, device=device),
+                                 torch.tensor(args.hard_w, device=device),
                                  torch.tensor(1.0, device=device))
 
                 lce = listwise_ce(scores, final, weight=hw)
@@ -348,7 +352,7 @@ def main():
                     dl_s = delta(at, yf, mem_s, pad_mask=pad_s)
                     sc_s = score_with_delta(b["b0"].to(device), dl_s)
                     l_s = listwise_ce(sc_s, final, weight=hw)
-                    lc = F.relu(MU - (l_s - lce))
+                    lc = F.relu(args.mu - (l_s - lce))
                     lmain = lmain + args.lam_c * lc
 
             loss = lmain + args.lam_ret * lret
