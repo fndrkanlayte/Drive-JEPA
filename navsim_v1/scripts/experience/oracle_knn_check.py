@@ -177,7 +177,7 @@ def oof_predict(fit_predict, x, y, mask, log, seed, n_folds=5) -> np.ndarray:
         if len(np.unique(y[tr])) < 2:
             oof[va] = y[tr].mean() if len(tr) else y[mask].mean()
         else:
-            oof[va] = fit_predict(x[tr], y[tr], x[va])
+            oof[va] = fit_predict(x[tr], y[tr], x[idx[va]])
     return oof
 
 
