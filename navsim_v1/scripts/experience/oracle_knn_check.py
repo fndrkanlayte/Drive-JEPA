@@ -51,6 +51,7 @@ from navsim.agents.drive_jepa_perception_based.experience.descriptors import (  
     descriptor_feature_vector,
 )
 from navsim.agents.drive_jepa_perception_based.experience.knn import (  # noqa: E402
+    eval_with_ci,
     knn_predict,
     metric_bundle,
     predict_proba_or_prior,
@@ -142,6 +143,44 @@ def load_dataset(labels_dir: Path, export_dir: Path, main_vehicle: str, fields: 
     return scenes
 
 
+def _desc_fit_predict(x_tr, y_tr, x_va, prior: float, seed: int) -> np.ndarray:
+    """GBDT (logreg fallback) descriptor-model proba for x_va."""
+    try:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        if len(np.unique(y_tr)) < 2:
+            return np.full(len(x_va), prior)
+        gb = HistGradientBoostingClassifier(max_iter=200, random_state=seed)
+        gb.fit(x_tr, y_tr)
+        return gb.predict_proba(x_va)[:, 1]
+    except ImportError:
+        return predict_proba_or_prior(safe_logreg(x_tr, y_tr), x_va, prior)
+
+
+def oof_predict(fit_predict, x, y, mask, log, seed, n_folds=5) -> np.ndarray:
+    """Out-of-fold proba for rows under `mask`, split into n_folds BY LOG.
+
+    Any stacked feature that is itself trained on query_train must enter the
+    stacker via out-of-fold predictions, or the meta-model just memorizes.
+    """
+    idx = np.flatnonzero(mask)
+    logs = np.unique(log[idx])
+    fold_of = {l: i % n_folds for i, l in enumerate(
+        np.random.default_rng(seed).permutation(logs))}
+    fold_row = np.array([fold_of[l] for l in log[idx]])
+    oof = np.full(len(idx), np.nan)
+    for f in range(n_folds):
+        tr = idx[fold_row != f]
+        va = fold_row == f
+        if not va.any():
+            continue
+        if len(np.unique(y[tr])) < 2:
+            oof[va] = y[tr].mean() if len(tr) else y[mask].mean()
+        else:
+            oof[va] = fit_predict(x[tr], y[tr], x[idx[va]])
+    return oof
+
+
 def flatten(scenes: List[dict], target_col: int, dt_enter_thresh: float = 2.0):
     """Flatten scenes to per-candidate arrays."""
     rows = []
@@ -159,23 +198,6 @@ def flatten(scenes: List[dict], target_col: int, dt_enter_thresh: float = 2.0):
         )
     return {k: np.concatenate([r[k] for r in rows]) for k in rows[0]}
 
-
-def eval_with_ci(pred, y, scene_ids, num_boot, seed):
-    """Metrics + scene-level bootstrap 95% CIs."""
-    point = metric_bundle(pred, y, scene_ids)
-    scenes = np.unique(scene_ids)
-    rng = np.random.default_rng(seed)
-    boots = {m: np.empty(num_boot) for m in point}
-    for b in range(num_boot):
-        keep = rng.choice(scenes, size=len(scenes), replace=True)
-        idx = np.concatenate([np.flatnonzero(scene_ids == s) for s in keep])
-        sid_map = np.repeat(np.arange(len(keep)), [int((scene_ids == s).sum()) for s in keep])
-        for m, v in metric_bundle(pred[idx], y[idx], sid_map).items():
-            boots[m][b] = v
-    return {
-        m: (point[m], float(np.nanpercentile(v, 2.5)), float(np.nanpercentile(v, 97.5)))
-        for m, v in boots.items()
-    }
 
 
 def main() -> None:
@@ -256,23 +278,26 @@ def main() -> None:
             knn_stats[k] = (mean_, var_)
 
         # 4. parametric on TRUE descriptors (GBDT)
-        try:
-            from sklearn.ensemble import HistGradientBoostingClassifier
+        preds["parametric_desc"] = _desc_fit_predict(
+            z_all[qtr], y[qtr], z_all, prior, args.seed)
 
-            if len(np.unique(y[qtr])) > 1:
-                gb = HistGradientBoostingClassifier(max_iter=200, random_state=args.seed)
-                gb.fit(z_all[qtr], y[qtr])
-                preds["parametric_desc"] = gb.predict_proba(z_all)[:, 1]
-            else:
-                preds["parametric_desc"] = np.full(len(y), prior)
-        except ImportError:
-            clf2 = safe_logreg(z_all[qtr], y[qtr])
-            preds["parametric_desc"] = predict_proba_or_prior(clf2, z_all, prior)
+        # out-of-fold versions (5-fold by log) for stacking: every stacked
+        # feature trained on query_train enters the meta-model via OOF preds
+        oof_noexp = oof_predict(
+            lambda a, b, c: predict_proba_or_prior(safe_logreg(a, b), c, prior),
+            f_all, y, qtr, log_block, args.seed)
+        oof_desc = oof_predict(
+            lambda a, b, c: _desc_fit_predict(a, b, c, prior, args.seed),
+            z_all, y, qtr, log_block, args.seed)
+        p_noexp_stack = preds["parametric_noexp"].copy()
+        p_noexp_stack[qtr] = oof_noexp
+        p_desc_stack = preds["parametric_desc"].copy()
+        p_desc_stack[qtr] = oof_desc
 
         # 5. no-exp parametric + oracle-kNN features
         k_main = args.ks[-1]
         km, kv = knn_stats[k_main]
-        stack = np.stack([preds["parametric_noexp"], km, kv], axis=1)
+        stack = np.stack([p_noexp_stack, km, kv], axis=1)
         stack = np.nan_to_num(stack, nan=prior)
         clf3 = safe_logreg(stack[qtr], y[qtr])
         preds["noexp_plus_knn"] = predict_proba_or_prior(clf3, stack, prior)
@@ -282,9 +307,16 @@ def main() -> None:
             z_all[mem], y[mem], z_all, k_main,
             pool_block=log_block[mem], query_block=log_block, rng=rng,
         )
-        stack_r = np.nan_to_num(np.stack([preds["parametric_noexp"], rm, rv], axis=1), nan=prior)
+        stack_r = np.nan_to_num(np.stack([p_noexp_stack, rm, rv], axis=1), nan=prior)
         clf4 = safe_logreg(stack_r[qtr], y[qtr])
         preds["random_memory"] = predict_proba_or_prior(clf4, stack_r, prior)
+
+        # 7. noexp + parametric_desc stack: the same-info parametric
+        #    counterpart of noexp_plus_knn
+        stack_d = np.nan_to_num(
+            np.stack([p_noexp_stack, p_desc_stack], axis=1), nan=prior)
+        clf5 = safe_logreg(stack_d[qtr], y[qtr])
+        preds["noexp_plus_desc"] = predict_proba_or_prior(clf5, stack_d, prior)
 
         # ---- evaluate on query-val ----
         sub = data["subset"]

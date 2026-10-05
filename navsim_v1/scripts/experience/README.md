@@ -119,3 +119,77 @@ python scripts/experience/oracle_knn_check.py \
 5. A5: the `oracle_*` predictors use the query's TRUE future — an upper bound,
    not deployable signal. `parametric_desc` vs `oracle_knn` tells you if
    retrieval adds anything beyond a parametric read of the same info.
+
+## Q11 candidate-level diagnostic (navtrain query_val, 810 scenes; pre-registered)
+
+`q11_diag.py` evaluates candidate-scoring methods on query_val only
+(navtest is never touched). Pre-registered definitions:
+
+Scene subsets (evaluated on scenes, masks fixed before looking at results):
+- `all`: every query_val scene.
+- `S_err`: the native-argmax candidate has NC<1 or TTC<1, AND the scene
+  contains at least one candidate with NC==1 AND TTC==1.
+- `S_flip`: the scene's candidates contain both unsafe (NC<1 or TTC<1)
+  and fully-safe (NC==1 AND TTC==1) outcomes.
+- `S_int_<itype>` (itype in SAME_DIR / CROSSING / ONCOMING): the
+  native-argmax candidate's noatt main descriptor has conflict=1,
+  |dt_enter|<2s, and that itype.
+- `S_int_*_turn`: same, plus ego heading change >30 deg over the
+  candidate horizon (|wrap(theta_last - theta_first)| of the argmax
+  candidate's proposal).
+
+Candidate density tertiles (rarity in descriptor space):
+- Descriptor space = the timing descriptor feature vector
+  (TIMING_FIELDS + ego_speed + itype one-hot, i.e. rows["desc"]),
+  standardized by memory mean/std, NaN -> 0.
+- density(candidate) = mean Euclidean distance to the k=20 nearest
+  MEMORY rows (query_train/query_val excluded), excluding same-log
+  memory rows.
+- Tertile edges are the 33.3/66.7 percentiles of the same density
+  computed for MEMORY rows themselves (each memory row vs its 20NN in
+  memory, same-log excluded) — thresholds fixed from memory, not from
+  the queries.
+- A scene's tertile = the tertile of its native-argmax candidate's
+  density. Candidate-pooled metrics use each candidate's own tertile.
+
+Methods (score per candidate; higher = riskier):
+- native_pdm: 1 - pdm_score.
+- noexp / noexp_int / random / shuffle / retrieval / retrieval_int /
+  pred_desc_retrieval_pp: query_val risk npz columns (mean over seeds).
+- oracle_knn: mean label of the 16 nearest memory rows in true-desc
+  space (same desc features as density; same-log excluded). Timing
+  fields only, no GT fields.
+- parametric_desc: logistic regression desc -> label, trained on
+  memory rows only, applied to query_val.
+
+Metrics per subset x tertile (95% CI by scene bootstrap):
+- within-scene AUPRC for nc_unsafe and ttc_bad (per-scene AP, averaged
+  over scenes with >=1 positive).
+- mean rank (1..32) of the safest candidate under the method ordering
+  (safest = argmax labelled final among NC==1 & TTC==1 candidates;
+  ordering by descending -risk or pdm_score).
+- top-1 unsafe rate: fraction of scenes where the argmin-risk (or
+  argmax-pdm) pick has NC<1 or TTC<1.
+- n scenes, n positive candidates per label.
+
+## EWM-JEPA Step 2: latent + outcome caches (new direction)
+
+Frozen-encoder latent cache for the Experience-Conditioned Latent World Model:
+
+- `export_latents.py` — per-scene `<log>/<token>.npz` with `image_feature`
+  (512,256) f16 (scene-level z_t), `bev_feature` (32,8,256) f16,
+  `proposal_feature`, `proposals`, `pred_logit`, `pdm_score`, `ego_status`,
+  `trajectory` (expert), `lidar2img`, `img_shape` (both needed to rebuild the
+  backbone tuple for external scoring). Resumable, sharded by log.
+- `experience/world_model.py` — `score_external_trajectories(model,
+  image_feature, ego_status, trajs)`: scores arbitrary trajectories by
+  re-running the shared `Bev_refiner` rounds with `pose=tau_ext` on a cached
+  `image_feature`; `pack_image_feature` rebuilds the backbone tuple from npz.
+- `test_score_external.py` — verifies argmax agreement >=99% when fed the
+  model's own proposals, plus a reversed-poses control.
+- `compute_anchor_subscores.py` — per-scene (n_anchor,6) PDM subscores over
+  the 8192-anchor vocabulary (v1 port of calc_anchors_scores, no
+  scores_index dependency). CPU/multiprocess/resumable; `--anchor_subset` for
+  a fixed random subset.
+- `build_future_map.py` — token -> ~+4s same-log token map from
+  `ego_state.time_point.time_us` (for z_{t+H} targets); reports coverage.

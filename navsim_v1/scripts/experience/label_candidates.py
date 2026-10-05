@@ -58,7 +58,12 @@ from navsim.agents.drive_jepa_perception_based.experience.records import (  # no
     save_npz,
 )
 from navsim.agents.drive_jepa_perception_based.experience.descriptors import (  # noqa: E402
+    ACLASS_BICYCLE,
+    ACLASS_NAMES,
+    ACLASS_PEDESTRIAN,
+    ACLASS_VEHICLE,
     DESCRIPTOR_FIELDS,
+    DESCRIPTOR_FIELDS_EXT,
     NUM_DESCRIPTOR_FIELDS,
     ITYPE_NAMES,
     compute_interaction_descriptor,
@@ -85,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefilter_dist", type=float, default=50.0,
                    help="only describe vehicles within this distance [m] of the "
                         "candidate's swept ego bounding box")
+    p.add_argument("--include_vru", action="store_true",
+                   help="additionally write multi_* arrays covering VEHICLE + "
+                        "PEDESTRIAN + BICYCLE tracks with agent_class and the "
+                        "`emerging` flag (t0-absent, later-conflicting). "
+                        "Vehicle-only outputs stay identical.")
+    p.add_argument("--top_m_vru", type=int, default=6,
+                   help="top-m slots of the multi_* descriptor array")
     return p.parse_args()
 
 
@@ -150,6 +162,8 @@ def label_scene(
     top_m: int,
     prefilter_dist: float,
     cache_type: str = "auto",
+    include_vru: bool = False,
+    top_m_vru: int = 6,
 ) -> str:
     """Label one exported scene; returns out_path."""
     from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -224,12 +238,29 @@ def label_scene(
         if obj.tracked_object_type == TrackedObjectType.VEHICLE
     ]
 
+    multi_tokens: List[str] = []
+    if include_vru:
+        aclass_of = {
+            TrackedObjectType.VEHICLE: ACLASS_VEHICLE,
+            TrackedObjectType.PEDESTRIAN: ACLASS_PEDESTRIAN,
+            TrackedObjectType.BICYCLE: ACLASS_BICYCLE,
+        }
+        multi_tokens = [
+            tok for tok, obj in unique_objects.items()
+            if obj.tracked_object_type in aclass_of
+        ]
+
     descriptors = np.full((num_cand, top_m, NUM_DESCRIPTOR_FIELDS), np.nan, dtype=np.float32)
     vehicle_mask = np.zeros((num_cand, top_m), dtype=bool)
     main_vehicle_token = np.array([""] * num_cand, dtype=object)
     main_desc_noatt = np.full((num_cand, NUM_DESCRIPTOR_FIELDS), np.nan, dtype=np.float32)
     main_vehicle_token_noatt = np.array([""] * num_cand, dtype=object)
     fault_vehicle_flag = np.zeros(num_cand, dtype=bool)
+
+    n_ext = len(DESCRIPTOR_FIELDS_EXT)
+    multi_descriptors = np.full((num_cand, top_m_vru, n_ext), np.nan, dtype=np.float32)
+    multi_mask = np.zeros((num_cand, top_m_vru), dtype=bool)
+    multi_toks = np.array([[""] * top_m_vru for _ in range(num_cand)], dtype=object)
 
     for k in range(num_cand):
         ego_polys = list(scorer._ego_polygons[k])  # (T+1,) shapely, global frame
@@ -295,6 +326,65 @@ def label_scene(
             main_desc_noatt[k] = [descs[di][f] for f in DESCRIPTOR_FIELDS]
             main_vehicle_token_noatt[k] = desc_tokens[di]
 
+        # ---- multi-class descriptors (vehicle + pedestrian + bicycle) --------
+        if include_vru:
+            m_descs: List[Dict[str, float]] = []
+            m_tokens: List[str] = []
+            for tok in multi_tokens:
+                obj = unique_objects[tok]
+                occ0 = observation[0]
+                # spatial prefilter: on the t=0 polygon when present, else on
+                # the first frame the track appears (emerging agents)
+                prefilter_xy = None
+                if tok in occ0.token_to_idx:
+                    j0 = occ0[tok]
+                    prefilter_xy = (j0.centroid.x, j0.centroid.y)
+                else:
+                    for t in range(1, num_steps):
+                        occ = observation[t]
+                        if tok in occ.token_to_idx:
+                            jt = occ[tok]
+                            prefilter_xy = (jt.centroid.x, jt.centroid.y)
+                            break
+                if prefilter_xy is None:
+                    continue
+                cx, cy = prefilter_xy
+                if not (prefilter_box[0] <= cx <= prefilter_box[2]
+                        and prefilter_box[1] <= cy <= prefilter_box[3]):
+                    continue
+
+                j_polys: List[Optional[object]] = []
+                for t in range(num_steps):
+                    occ = observation[t]
+                    j_polys.append(occ[tok] if tok in occ.token_to_idx else None)
+
+                velocity = getattr(obj, "velocity", None)
+                j_speed = (
+                    float(np.hypot(velocity.x, velocity.y))
+                    if velocity is not None else np.nan
+                )
+                d = compute_interaction_descriptor(
+                    ego_polys,
+                    j_polys,
+                    ego_heading=ego_heading,
+                    j_heading=float(obj.box.center.heading),
+                    j_speed=j_speed,
+                    dt=dt,
+                    att_collision=tok in att_col_set,
+                    att_ttc=tok in att_ttc_set,
+                    agent_class=float(aclass_of[obj.tracked_object_type]),
+                )
+                m_descs.append(d)
+                m_tokens.append(tok)
+
+            m_order = select_top_m_vehicles(m_descs, top_m_vru)
+            for rank, di in enumerate(m_order):
+                multi_descriptors[k, rank] = [
+                    m_descs[di][f] for f in DESCRIPTOR_FIELDS_EXT
+                ]
+                multi_mask[k, rank] = True
+                multi_toks[k, rank] = m_tokens[di]
+
     # ---- misc labels ----------------------------------------------------------
     es = np.asarray(rec["ego_status"], dtype=np.float64) if "ego_status" in rec else np.full(11, np.nan)
     ego_speed = float(np.hypot(es[3], es[4])) if np.isfinite(es[3:5]).all() else np.nan
@@ -321,6 +411,15 @@ def label_scene(
         ade_to_human=ade.astype(np.float32),
         ego_speed=np.float32(ego_speed),
         pdm_score=rec["pdm_score"].astype(np.float32),
+        **(
+            {
+                "multi_descriptors": multi_descriptors,
+                "multi_mask": multi_mask,
+                "multi_tokens": np.asarray(multi_toks, dtype=object),
+            }
+            if include_vru
+            else {}
+        ),
     )
     return out_path
 
@@ -338,7 +437,8 @@ def main() -> None:
         token_filter = {l.strip() for l in open(args.token_list) if l.strip()}
 
     jobs = []
-    for rec_path in sorted(export_dir.glob("*.npz")):
+    # flat dirs (export_candidates) and log-nested dirs (export_latents)
+    for rec_path in sorted(export_dir.glob("*.npz")) + sorted(export_dir.glob("*/*.npz")):
         token = rec_path.stem
         if token_filter is not None and token not in token_filter:
             continue
@@ -357,7 +457,7 @@ def main() -> None:
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(label_scene, rp, mcp, op, args.top_m, args.prefilter_dist,
-                        args.cache_type): rp
+                        args.cache_type, args.include_vru, args.top_m_vru): rp
             for rp, mcp, op in jobs
         }
         for i, fut in enumerate(as_completed(futures)):
@@ -395,6 +495,16 @@ def main() -> None:
         "vehicle_mask": "bool (num_candidates, top_m) - real vehicle in slot",
         "main_vehicle_token": "track token of descriptors[:,0] ('' if none)",
         "descriptor_feature_vector": descriptor_feature_names(),
+        "multi_descriptors": {
+            "shape": ["num_candidates", "top_m_vru", "num_fields_ext"],
+            "fields": DESCRIPTOR_FIELDS_EXT,
+            "agent_class_codes": {str(k): v for k, v in ACLASS_NAMES.items()},
+            "note": "only when --include_vru: same fields + agent_class + "
+                    "emerging (t0-absent, later-conflicting), covering "
+                    "VEHICLE/PEDESTRIAN/BICYCLE tracks ranked together",
+        },
+        "multi_mask": "bool (num_candidates, top_m_vru) - real agent in slot",
+        "multi_tokens": "track tokens of multi_descriptors slots ('' if none)",
     }
     with open(out_dir / "schema.json", "w") as f:
         json.dump(schema, f, indent=2)

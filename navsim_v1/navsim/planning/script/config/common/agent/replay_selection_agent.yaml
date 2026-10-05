@@ -1,0 +1,6 @@
+_target_: navsim.agents.replay_selection_agent.ReplaySelectionAgent
+_convert_: 'all'
+
+# npz written by scripts/experience/export_selections.py
+# (tokens (S,) + trajectories (S,8,3) float32)
+selection_file: ''

@@ -162,3 +162,21 @@ def metric_bundle(pred: np.ndarray, y: np.ndarray, scene_ids: np.ndarray) -> Dic
         "auprc": auprc(pred, y),
         "top1_risk": float(np.mean(top1_risk_hits(pred, y, scene_ids))),
     }
+
+
+def eval_with_ci(pred, y, scene_ids, num_boot, seed):
+    """Metrics + scene-level bootstrap 95% CIs."""
+    point = metric_bundle(pred, y, scene_ids)
+    scenes = np.unique(scene_ids)
+    rng = np.random.default_rng(seed)
+    boots = {m: np.empty(num_boot) for m in point}
+    for b in range(num_boot):
+        keep = rng.choice(scenes, size=len(scenes), replace=True)
+        idx = np.concatenate([np.flatnonzero(scene_ids == s) for s in keep])
+        sid_map = np.repeat(np.arange(len(keep)), [int((scene_ids == s).sum()) for s in keep])
+        for m, v in metric_bundle(pred[idx], y[idx], sid_map).items():
+            boots[m][b] = v
+    return {
+        m: (point[m], float(np.nanpercentile(v, 2.5)), float(np.nanpercentile(v, 97.5)))
+        for m, v in boots.items()
+    }
