@@ -198,6 +198,7 @@ def main() -> None:
 
     records: List[dict] = []
     n_skipped = 0
+    skipped_tokens = []
 
     def run_batch(feature_list, meta_list):
         with torch.no_grad():
@@ -305,6 +306,7 @@ def main() -> None:
                 agent_input = scene.get_agent_input()
             except Exception as e:
                 n_skipped += 1
+                skipped_tokens.append((token, str(e)[:120]))
                 consec_fail += 1
                 if consec_fail >= 50:
                     raise RuntimeError(
@@ -348,6 +350,13 @@ def main() -> None:
     print(f"[export] wrote {len(existing)} records total ({len(records)} this run) -> {out_dir}")
     if n_skipped:
         print(f"[export] skipped scenes (missing data): {n_skipped}")
+        if skipped_tokens:
+            tag = Path(args.token_list).stem if args.token_list else "all"
+            skip_path = out_dir / f"skipped_{tag}.txt"
+            with open(skip_path, "a") as fh:
+                for t, err in skipped_tokens:
+                    fh.write(f"{t}\t{err}\n")
+            print(f"[export] skipped tokens logged -> {skip_path}")
     if n_skipped and not existing:
         raise RuntimeError(
             "every attempted scene failed -- check the warnings above "
