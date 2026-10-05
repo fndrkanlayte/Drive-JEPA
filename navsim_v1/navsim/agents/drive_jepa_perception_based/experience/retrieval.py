@@ -176,6 +176,56 @@ def desc_retrieval_features(
     return out
 
 
+def desc_retrieval_neighbour_rows(
+    q_desc: np.ndarray,
+    q_scene: np.ndarray,
+    q_log: np.ndarray,
+    mem_desc: np.ndarray,
+    mem_labels: np.ndarray,
+    mem_scene: np.ndarray,
+    mem_log: np.ndarray,
+    cont_cols: np.ndarray,
+    mem_desc_valid: np.ndarray,
+    topk: int = 16,
+    max_per_scene: int = 4,
+    chunk: int = 512,
+    device: Optional[str] = None,
+) -> np.ndarray:
+    """Per-neighbour packed features for the DeepSets variant (Q10/3).
+
+    For each of the ``topk`` picked neighbours stores
+    ``[sim_i, r_i (n_targets), d_i (D), d_hat_k - d_i (len(cont_cols))]``;
+    categorical fields inside ``d_i`` are already one-hot in the descriptor
+    vector. Returns (N, topk*Dn + topk): the trailing ``topk`` columns are the
+    slot mask (1 = real neighbour).
+    """
+    n_t = mem_labels.shape[1]
+    D = mem_desc.shape[1]
+    C = len(cont_cols)
+    Dn = 1 + n_t + D + C
+    out = np.zeros((len(q_desc), topk * Dn + topk), dtype=np.float32)
+    for i, picked, picked_s in _pick_neighbours(
+            q_desc, q_log, mem_desc, mem_scene, mem_log,
+            topk, max_per_scene, chunk, device):
+        k = len(picked)
+        base = out[i, : topk * Dn].reshape(topk, Dn)
+        base[:k, 0] = picked_s
+        base[:k, 1:1 + n_t] = mem_labels[picked]
+        base[:k, 1 + n_t:1 + n_t + D] = mem_desc[picked]
+        diff = (q_desc[i, cont_cols][None, :]
+                - mem_desc[picked][:, cont_cols])
+        valid = mem_desc_valid[picked][:, cont_cols]
+        base[:k, 1 + n_t + D:] = np.where(valid, diff, 0.0)
+        out[i, topk * Dn:topk * Dn + k] = 1.0
+    return out
+
+
+def ds_dims(n_targets: int, desc_dim: int, n_cont: int, topk: int):
+    """(Dn per neighbour, packed exp width) for ``*_ds`` variants."""
+    dn = 1 + n_targets + desc_dim + n_cont
+    return dn, topk * dn + topk
+
+
 def random_features(
     n: int,
     q_log: np.ndarray,
@@ -201,12 +251,17 @@ def random_features(
     return out
 
 
-def exp_dim_for(variant: str, latent: int, n_cont: int = 0) -> int:
+def exp_dim_for(variant: str, latent: int, n_cont: int = 0,
+                topk: int = 16, n_targets: int = 2,
+                desc_dim: int = 0) -> int:
     """Width of the experience-feature block appended to the latent."""
     if variant in ("noexp", "noexp_int"):
         return 0
     if variant == "random":
         return 4
+    if variant.endswith("_ds"):
+        _, w = ds_dims(n_targets, desc_dim, n_cont, topk)
+        return w
     if variant.startswith("pred_desc"):
         return 4 + n_cont + 1  # label mean/var + mean desc gap + mean sim
     return 4 + latent  # retrieval / retrieval_int / shuffle

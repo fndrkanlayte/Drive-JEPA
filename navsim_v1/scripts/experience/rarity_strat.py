@@ -39,12 +39,12 @@ from navsim.agents.drive_jepa_perception_based.experience.records import (  # no
 )
 
 SUB_NC, SUB_EP, SUB_TTC, SUB_FINAL = 0, 2, 3, 5
-RISK_VARIANT = "noexp_int"          # best ungated risk variant
-RISK_LAM = 0.5
-FUSION_VARIANT = "pred_desc_retrieval_pp"  # best Q5b on navtest
-FUSION_ALPHA, FUSION_REGION, FUSION_EPS = 0.2, ("topk", 2.0), 0.05
-RAND_VARIANT = "random"             # Q5b control
-RAND_ALPHA, RAND_REGION, RAND_EPS = 0.2, ("margin", 0.005), 0.0
+# risk-penalty rows: (variant, lambda tuned on query_val 5-fold CV)
+RISK_ROWS = [("noexp_int", 0.5), ("retrieval_int", 0.5),
+             ("pred_desc_retrieval", 0.5), ("pred_desc_retrieval_pp", 0.5),
+             ("retrieval", 1.0), ("random", 0.5)]
+FUSION_ROWS = [("pred_desc_retrieval_pp", 0.2, ("topk", 2.0), 0.05),
+               ("random", 0.2, ("margin", 0.005), 0.0)]
 KNN = 10
 
 
@@ -141,32 +141,33 @@ def main() -> None:
     sel0 = np.argmax(nt["pdm_score"], axis=1)
     scene_subset = nt["subset"][np.arange(S), sel0]
 
-    # selectors
-    sel_risk = sel0.copy()
-    sel_fus = sel0.copy()
-    risk = load_npz(Path(args.navtest_risk_dir) / f"{RISK_VARIANT}.npz")
-    t2r = {t: i for i, t in enumerate(risk["tokens"].tolist())}
-    idx = np.array([t2r[t] for t in nt["tokens"] if t in t2r])
-    keep = np.array([i for i, t in enumerate(nt["tokens"]) if t in t2r])
-    corr = 1.0 - (1.0 - risk["risk"][idx][..., 0]) \
-        * (1.0 - risk["risk"][idx][..., 1])
-    sel_risk[keep] = np.argmax(
-        nt["pdm_score"][keep] - RISK_LAM * corr.astype(np.float64), axis=1)
-    sel_fus[keep] = fr.fused_select(
-        nt["pred_logit"][keep], risk["risk"][idx], FUSION_ALPHA,
-        nt["pdm_score"][keep], FUSION_REGION, FUSION_EPS, sel0[keep])
-    sel_rand = sel0.copy()
-    risk_r = load_npz(Path(args.navtest_risk_dir) / f"{RAND_VARIANT}.npz")
-    t2rr = {t: i for i, t in enumerate(risk_r["tokens"].tolist())}
-    idx_r = np.array([t2rr[t] for t in nt["tokens"] if t in t2rr])
-    keep_r = np.array([i for i, t in enumerate(nt["tokens"]) if t in t2rr])
-    sel_rand[keep_r] = fr.fused_select(
-        nt["pred_logit"][keep_r], risk_r["risk"][idx_r], RAND_ALPHA,
-        nt["pdm_score"][keep_r], RAND_REGION, RAND_EPS, sel0[keep_r])
-    selectors = [("original_argmax", sel0),
-                 (f"{RAND_VARIANT}(Q5b control)", sel_rand),
-                 (f"{RISK_VARIANT}(lam={RISK_LAM})", sel_risk),
-                 (f"{FUSION_VARIANT}(Q5b)", sel_fus)]
+    # selectors -----------------------------------------------------------
+    risks = {}
+    for v, _ in RISK_ROWS + [(v, None) for v, _, _, _ in FUSION_ROWS]:
+        if v in risks:
+            continue
+        risk = load_npz(Path(args.navtest_risk_dir) / f"{v}.npz")
+        t2r = {t: i for i, t in enumerate(risk["tokens"].tolist())}
+        idx = np.array([t2r[t] for t in nt["tokens"] if t in t2r])
+        keep = np.array([i for i, t in enumerate(nt["tokens"]) if t in t2r])
+        risks[v] = (risk["risk"][idx], keep)
+
+    selectors = [("original_argmax", sel0)]
+    for v, lam in RISK_ROWS:
+        sel = sel0.copy()
+        rr, keep = risks[v]
+        corr = 1.0 - (1.0 - rr[..., 0].astype(np.float64)) \
+            * (1.0 - rr[..., 1].astype(np.float64))
+        sel[keep] = np.argmax(
+            nt["pdm_score"][keep] - lam * corr, axis=1)
+        selectors.append((f"{v}(lam={lam})", sel))
+    for v, alpha, region, eps in FUSION_ROWS:
+        sel = sel0.copy()
+        rr, keep = risks[v]
+        sel[keep] = fr.fused_select(
+            nt["pred_logit"][keep], rr, alpha,
+            nt["pdm_score"][keep], region, eps, sel0[keep])
+        selectors.append((f"{v}(Q5b)", sel))
 
     rows_md = []
     results = {}
@@ -183,17 +184,56 @@ def main() -> None:
                                 fmt_ci(*res[m]),
                                 f"{res['frac_changed']:.3f}"])
 
-    # conflict ∩ top-30% rarity
+    # conflict ∩ top-30% rarity + top-10% (all scenes)
     top30 = rare >= np.quantile(rare, 0.7)
-    keep_c = scene_subset & top30
+    top10 = rare >= np.quantile(rare, 0.9)
+    extra_subsets = [("conflict ∩ top-30% rare", scene_subset & top30),
+                     ("top-10% rare", top10),
+                     ("conflict ∩ top-10% rare", scene_subset & top10)]
     rows_md2 = []
-    for name, sel in selectors:
-        res = eval_subset(sel, nt["subscores"], keep_c, args.num_boot,
-                          args.split_seed, sel0)
-        results[f"{name}|conflict_top30"] = res
-        for m in ("final", "NC", "TTC", "EP"):
-            rows_md2.append([name, m, fmt_ci(*res[m]),
-                             f"{res['frac_changed']:.3f}"])
+    for sname, keep_x in extra_subsets:
+        for name, sel in selectors:
+            res = eval_subset(sel, nt["subscores"], keep_x, args.num_boot,
+                              args.split_seed, sel0)
+            results[f"{name}|{sname}"] = res
+            for m in ("final", "NC", "TTC", "EP"):
+                rows_md2.append([sname, name, m, fmt_ci(*res[m]),
+                                 f"{res['frac_changed']:.3f}"])
+
+    # candidate-level NC/TTC AUPRC per decile (risk npz mean over seeds)
+    def auprc(y_true, score):
+        order = np.argsort(-score)
+        tp = np.cumsum(y_true[order])
+        fp = np.cumsum(1 - y_true[order])
+        prec = tp / np.maximum(tp + fp, 1)
+        rec = tp / max(tp[-1], 1)
+        return float(np.sum(
+            (rec[1:] - rec[:-1]) * (prec[1:] + prec[:-1]) / 2)
+            + rec[0] * prec[0]) if tp[-1] > 0 else np.nan
+
+    y_nc = (nt["subscores"][..., 0] < 1.0).ravel()
+    y_ttc = (nt["subscores"][..., 3] < 1.0).ravel()
+    rows_auprc = []
+    for v, _ in RISK_ROWS:
+        if v not in risks:
+            continue
+        rr, keep = risks[v]
+        rh_nc = np.clip(rr[..., 0], 0, 1).ravel()
+        rh_ttc = np.clip(rr[..., 1], 0, 1).ravel()
+        keep_r = np.repeat(keep, rr.shape[1])
+        for d in range(10):
+            lo, hi = dec[d], dec[d + 1]
+            dm = ((rare >= lo) & (rare <= hi) if d == 9
+                  else (rare >= lo) & (rare < hi))
+            sel_c = np.repeat(dm, rr.shape[1]) & keep_r
+            rows_auprc.append([v, f"d{d}",
+                               f"{auprc(y_nc[sel_c], rh_nc[sel_c]):.4f}",
+                               f"{auprc(y_ttc[sel_c], rh_ttc[sel_c]):.4f}"])
+        for sname, keep_x in extra_subsets:
+            sel_c = np.repeat(keep_x, rr.shape[1]) & keep_r
+            rows_auprc.append([v, sname,
+                               f"{auprc(y_nc[sel_c], rh_nc[sel_c]):.4f}",
+                               f"{auprc(y_ttc[sel_c], rh_ttc[sel_c]):.4f}"])
 
     md = ["# Q6 rarity stratification", ""]
     md.append(f"navtest scenes: {S} | rarity = mean cosine dist to "
@@ -207,10 +247,16 @@ def main() -> None:
     for r in rows_md:
         md.append("| " + " | ".join(r) + " |")
     md.append("")
-    md.append(f"## conflict ∩ top-30% rarity (n={int(keep_c.sum())})")
-    md.append("| selector | metric | value [95% CI] | frac_changed |")
-    md.append("|---|---|---|---|")
+    md.append("## tail subsets (all scenes + conflict ∩ rare)")
+    md.append("| subset | selector | metric | value [95% CI] | frac_changed |")
+    md.append("|---|---|---|---|---|")
     for r in rows_md2:
+        md.append("| " + " | ".join(r) + " |")
+    md.append("")
+    md.append("## candidate-level AUPRC per decile (nc_unsafe / ttc_bad)")
+    md.append("| variant | decile | NC AUPRC | TTC AUPRC |")
+    md.append("|---|---|---|---|")
+    for r in rows_auprc:
         md.append("| " + " | ".join(r) + " |")
     (out_dir / "rarity_results.md").write_text("\n".join(md) + "\n")
     np.savez(out_dir / "rarity.npz", rarity=rare, tokens=nt["tokens"],

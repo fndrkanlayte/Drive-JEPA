@@ -104,10 +104,25 @@ class ExperienceModel(nn.Module):
 
     def __init__(self, feat_in_dim: int, head_in_dim: int, use_int: bool = False,
                  desc_dim: int = 0, hidden: int = 128, latent: int = 64,
-                 head_hidden: int = 64, n_targets: int = N_TARGETS):
+                 head_hidden: int = 64, n_targets: int = N_TARGETS,
+                 ds_cfg: Optional[Tuple[int, int]] = None):
         super().__init__()
         self.encoder = ExperienceEncoder(feat_in_dim, hidden, latent)
-        self.head = RiskHead(head_in_dim, head_hidden, n_targets)
+        # ds_cfg = (K, Dn): per-neighbour DeepSets aggregation over packed
+        # exp layout [K*Dn feats | K mask] (Q10/3), replacing the flat
+        # mean/var feature vector.
+        self.ds_cfg = ds_cfg
+        if ds_cfg is not None:
+            K, Dn = ds_cfg
+            self.ds_mlp = nn.Sequential(
+                nn.Linear(Dn, head_hidden),
+                nn.GELU(),
+                nn.Linear(head_hidden, head_hidden),
+            )
+            self.head = RiskHead(latent + head_hidden, head_hidden, n_targets)
+        else:
+            self.ds_mlp = None
+            self.head = RiskHead(head_in_dim, head_hidden, n_targets)
         self.int_head = InteractionHead(latent, head_hidden) if use_int else None
         self.desc_head = DescHead(latent, head_hidden, desc_dim) if desc_dim else None
 
@@ -121,7 +136,15 @@ class ExperienceModel(nn.Module):
                   desc (B,D) or None)
         """
         z = self.encoder(x)
-        logits = self.head(torch.cat([z, exp], dim=-1))
+        if self.ds_cfg is not None:
+            K, Dn = self.ds_cfg
+            nf = exp[:, : K * Dn].reshape(-1, K, Dn)
+            m = exp[:, K * Dn: K * Dn + K]
+            emb = self.ds_mlp(nf) * m[..., None]
+            agg = emb.sum(1) / m.sum(1, keepdim=True).clamp(min=1.0)
+            logits = self.head(torch.cat([z, agg], dim=-1))
+        else:
+            logits = self.head(torch.cat([z, exp], dim=-1))
         aux = self.int_head(z) if self.int_head is not None else None
         desc = self.desc_head(z) if self.desc_head is not None else None
         return logits, z, aux, desc
