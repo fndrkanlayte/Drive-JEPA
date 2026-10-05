@@ -201,12 +201,16 @@ def pairwise_hinge(scores: torch.Tensor, final: torch.Tensor,
 def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
               final: torch.Tensor, lam_kl: float = 1.0,
               lam_keep: float = 1.0, m: float = 0.5,
-              T: float = 1.0, keep_tol: float = 0.005) -> tuple:
+              T: float = 1.0, keep_tol: float = 0.005,
+              fix_mode: str = "b0") -> tuple:
     """Top-1 anchored objective (Devin Bot spec).
 
     lkl   = KL(softmax(logit_b0/T) || softmax(scores/T))   trust region on all
-    lfix  = relu(m - (score[best] - score[b0pick]))        B0-wrong scenes only,
+    lfix  (b0):  relu(m - (score[best] - score[b0pick]))   B0-wrong scenes only,
             best = argmax final with B0-logit tie-break
+    lfix  (all): mean_k relu(m - (score[best] - score[k])) on wrong scenes,
+            over k with final[k] < f_best - keep_tol (incl. b0pick); a third
+            mediocre candidate can no longer take argmax unpenalised
     lkeep = mean_k relu(m - (score[b0pick] - score[k]))    B0-correct scenes,
             over k with final[k] < final[b0pick] - keep_tol
     returns (lmain, dict of parts) where
@@ -226,7 +230,13 @@ def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
     is_best = final >= (f_best[:, None] - 1e-9)
     best_idx = logit_b0.masked_fill(~is_best, -1e9).argmax(1)
     s_best = scores.gather(1, best_idx[:, None]).squeeze(1)
-    lfix_per = F.relu(m - (s_best - s_b0))
+    if fix_mode == "all":
+        # every candidate worse than best must stay a margin below it
+        sub_best = final < (f_best[:, None] - keep_tol)
+        lfix_all = (F.relu(m - (s_best[:, None] - scores)) * sub_best)
+        lfix_per = lfix_all.sum(1) / sub_best.sum(1).clamp(min=1)
+    else:
+        lfix_per = F.relu(m - (s_best - s_b0))
     if wrong.any():
         lfix = lfix_per[wrong].mean()
     else:

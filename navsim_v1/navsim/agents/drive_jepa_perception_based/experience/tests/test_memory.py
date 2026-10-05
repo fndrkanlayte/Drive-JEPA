@@ -227,6 +227,22 @@ def test_hinge_prefers_better_final():
     assert l_up < l_good < l_down
 
 
+def test_top1_fix_mode_all_penalises_third_candidate():
+    # wrong scene: b0pick has low final; best has highest. A third mediocre
+    # candidate k exceeding score[best] must raise loss under fix_mode=all
+    # but be invisible under fix_mode=b0 (locks the old hole).
+    b0 = torch.tensor([[0.9, 0.1, 0.2]])          # b0pick=idx0
+    final = torch.tensor([[0.50, 0.95, 0.60]])    # best=idx1, wrong scene
+    s_base = torch.tensor([[0.0, 0.3, 0.0]])      # scores: best>others
+    s_hole = torch.tensor([[0.0, 0.3, 0.9]])      # idx2 jumps to argmax
+    _, p_b0_base = top1_loss(s_base, b0, final, fix_mode="b0")
+    _, p_b0_hole = top1_loss(s_hole, b0, final, fix_mode="b0")
+    l_all_base, p_all_base = top1_loss(s_base, b0, final, fix_mode="all")
+    l_all_hole, _ = top1_loss(s_hole, b0, final, fix_mode="all")
+    assert l_all_hole > l_all_base                 # third cand penalised
+    assert abs(float(p_b0_hole["lfix"]) - float(p_b0_base["lfix"])) < 1e-5
+
+
 def test_lc_sg_blocks_grad_to_shuffled_branch():
     # lc = relu(mu - (l_s - l_ref)): with l_s detached the shuffled
     # branch must receive zero gradient through lc

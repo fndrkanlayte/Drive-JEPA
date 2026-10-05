@@ -227,6 +227,8 @@ def main():
     p.add_argument("--lam_keep", type=float, default=1.0)
     p.add_argument("--keep_tol", type=float, default=0.005,
                    help="lkeep covers candidates with final < f_b0 - keep_tol")
+    p.add_argument("--fix_mode", choices=["b0", "all"], default="b0",
+                   help="all: margin every candidate below best on wrong scenes")
     p.add_argument("--lc_sg", action="store_true",
                    help="stop-gradient on shuffled-memory branch of L_c")
     p.add_argument("--grad_clip", type=float, default=0.0,
@@ -437,7 +439,8 @@ def main():
                     lcore, _ = top1_loss(scores, b0_t, final,
                                          lam_kl=args.lam_kl,
                                          lam_keep=args.lam_keep,
-                                         keep_tol=args.keep_tol)
+                                         keep_tol=args.keep_tol,
+                                         fix_mode=args.fix_mode)
                     lmain = lcore + args.lam_dreg * ldr
                 else:
                     lce = listwise_ce(scores, final, weight=hw)
@@ -460,7 +463,8 @@ def main():
                         l_s, _ = top1_loss(sc_s, b0_t, final,
                                            lam_kl=args.lam_kl,
                                            lam_keep=args.lam_keep,
-                                           keep_tol=args.keep_tol)
+                                           keep_tol=args.keep_tol,
+                                           fix_mode=args.fix_mode)
                         l_ref = lcore
                     else:
                         l_s = listwise_ce(sc_s, final, weight=hw)
