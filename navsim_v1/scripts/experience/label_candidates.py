@@ -437,7 +437,8 @@ def main() -> None:
         token_filter = {l.strip() for l in open(args.token_list) if l.strip()}
 
     jobs = []
-    for rec_path in sorted(export_dir.glob("*.npz")):
+    # flat dirs (export_candidates) and log-nested dirs (export_latents)
+    for rec_path in sorted(export_dir.glob("*.npz")) + sorted(export_dir.glob("*/*.npz")):
         token = rec_path.stem
         if token_filter is not None and token not in token_filter:
             continue
