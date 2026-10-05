@@ -124,6 +124,10 @@ def parse_args():
     p.add_argument("--aux_weight", type=float, default=0.5)
     p.add_argument("--num_boot", type=int, default=1000)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
+    p.add_argument("--allowed_logs_file", default=None,
+                   help="json list of log names; restrict all rows to these "
+                        "logs BEFORE the memory/query split (Q7 held-out "
+                        "protocol: train on half A only)")
     p.add_argument("--task", choices=["risk", "residual"], default="risk",
                    help="risk: BCE on nc_unsafe/ttc_bad. residual: Huber "
                         "regression on y_res = labelled final - pdm_score "
@@ -505,6 +509,16 @@ def main() -> None:
     rows = load_rows(Path(args.labels_dir), Path(args.export_dir),
                      args.dt_enter_thresh)
     n_scenes = int(rows["n_scenes"])
+    if args.allowed_logs_file:
+        import json as _json
+        allowed = set(_json.load(open(args.allowed_logs_file)))
+        m = np.array([l in allowed for l in rows["log"]])
+        rows = {k: (v[m] if isinstance(v, np.ndarray)
+                    and v.ndim >= 1 and v.shape[0] == m.shape[0]
+                    else v) for k, v in rows.items()}
+        n_scenes = int(len(np.unique(rows["scene_id"])))
+        print(f"[exp] restricted to {len(allowed)} logs from "
+              f"{args.allowed_logs_file}")
     print(f"[exp] {n_scenes} scenes, {len(rows['y'])} candidates")
     residual = args.task == "residual"
     if residual:
@@ -575,7 +589,9 @@ def main() -> None:
                                            if variant.startswith("pred_desc")
                                            else 0),
                               "n_cont": len(rows["cont_cols"]),
-                              "latent": 64}},
+                              "latent": 64,
+                              "zm": np.asarray(zm).tolist(),
+                              "zs": np.asarray(zs).tolist()}},
                     mdir / f"{variant}_seed{seed}.pt")
 
     # ---- evaluate on query_val ---------------------------------------------

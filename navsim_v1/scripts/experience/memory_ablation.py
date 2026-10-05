@@ -67,6 +67,9 @@ def parse_args():
     p.add_argument("--topk", type=int, default=16)
     p.add_argument("--max_per_scene", type=int, default=4)
     p.add_argument("--dt_enter_thresh", type=float, default=2.0)
+    p.add_argument("--mem_logs_file", default=None,
+                   help="json list of log names forming the memory bank "
+                        "(Q7 held-out protocol); overrides the memory split")
     p.add_argument("--device",
                    default="cuda" if __import__("torch").cuda.is_available()
                    else "cpu")
@@ -92,10 +95,25 @@ def main() -> None:
                         args.dt_enter_thresh)
     groups = split_logs_by_name(sorted(set(rows["log"].tolist())),
                                 ratios=args.ratios, seed=args.split_seed)
-    mem_mask = np.isin(rows["log"], list(groups["memory"]))
-    qtr_mask = np.array(
-        [l in set(groups["query_train"]) for l in rows["log"]])
-    zm, zs = standardize_fit(rows["desc"][qtr_mask])
+    if args.mem_logs_file:
+        import json as _json
+        mem_logs = set(_json.load(open(args.mem_logs_file)))
+        mem_mask = np.isin(rows["log"], list(mem_logs))
+        print(f"[mem] memory bank from file: {len(mem_logs)} logs, "
+              f"{int(mem_mask.sum())} candidates")
+    else:
+        mem_mask = np.isin(rows["log"], list(groups["memory"]))
+    # desc standardization: prefer stats stored in the checkpoint (they were
+    # fit on the model's own training logs, e.g. the A half in Q7)
+    meta_probe = torch.load(
+        sorted(Path(args.models_dir).glob("*.pt"))[0], map_location="cpu")
+    if "zm" in meta_probe["meta"]:
+        zm = np.asarray(meta_probe["meta"]["zm"], dtype=np.float64)
+        zs = np.asarray(meta_probe["meta"]["zs"], dtype=np.float64)
+    else:
+        qtr_mask = np.array(
+            [l in set(groups["query_train"]) for l in rows["log"]])
+        zm, zs = standardize_fit(rows["desc"][qtr_mask])
     rows["desc_valid"] = np.isfinite(rows["desc"])
     rows["desc_z"] = np.nan_to_num((rows["desc"] - zm) / zs,
                                   nan=0.0).astype(np.float32)
