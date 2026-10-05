@@ -96,7 +96,8 @@ def main() -> None:
     qtr = rows["group"] == "query_train"
     zm, zs = standardize_fit(rows["desc"][qtr])
     rows["desc_valid"] = np.isfinite(rows["desc"])
-    rows["desc_z"] = np.nan_to_num((rows["desc"] - zm) / zs, nan=0.0)
+    rows["desc_z"] = np.nan_to_num((rows["desc"] - zm) / zs,
+                                  nan=0.0).astype(np.float32)
     names = te.descriptor_feature_names(te.TIMING_FIELDS)
     rows["cont_cols"] = np.array(
         [names.index(n) for n in te.DESC_CONT_NAMES], dtype=np.int64)
@@ -118,7 +119,8 @@ def main() -> None:
     nt = te.load_rows(Path(args.navtest_labels_dir),
                       Path(args.navtest_export_dir), args.dt_enter_thresh)
     nt["desc_valid"] = np.isfinite(nt["desc"])
-    nt["desc_z"] = np.nan_to_num((nt["desc"] - zm) / zs, nan=0.0)
+    nt["desc_z"] = np.nan_to_num((nt["desc"] - zm) / zs,
+                                nan=0.0).astype(np.float32)
     nt["cont_cols"] = rows["cont_cols"]
 
     # val rows in scene order (same as main(): scene_id-sorted via load_rows)

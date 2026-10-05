@@ -97,7 +97,8 @@ def main() -> None:
         [l in set(groups["query_train"]) for l in rows["log"]])
     zm, zs = standardize_fit(rows["desc"][qtr_mask])
     rows["desc_valid"] = np.isfinite(rows["desc"])
-    rows["desc_z"] = np.nan_to_num((rows["desc"] - zm) / zs, nan=0.0)
+    rows["desc_z"] = np.nan_to_num((rows["desc"] - zm) / zs,
+                                  nan=0.0).astype(np.float32)
     rows["cont_cols"] = np.array(
         [te.descriptor_feature_names(te.TIMING_FIELDS).index(n)
          for n in te.DESC_CONT_NAMES], dtype=np.int64)
@@ -117,7 +118,8 @@ def main() -> None:
     nt = te.load_rows(Path(args.navtest_labels_dir),
                       Path(args.navtest_export_dir), args.dt_enter_thresh)
     nt["desc_valid"] = np.isfinite(nt["desc"])
-    nt["desc_z"] = np.nan_to_num((nt["desc"] - zm) / zs, nan=0.0)
+    nt["desc_z"] = np.nan_to_num((nt["desc"] - zm) / zs,
+                                nan=0.0).astype(np.float32)
     nt["cont_cols"] = rows["cont_cols"]
     n_nt = len(nt["tokens"])
 
