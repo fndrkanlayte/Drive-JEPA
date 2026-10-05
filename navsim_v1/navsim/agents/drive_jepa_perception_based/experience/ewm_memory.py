@@ -340,9 +340,42 @@ def scene_o(proposals: np.ndarray, sub: np.ndarray,
     return o, mask
 
 
-def derange(idx2d: np.ndarray) -> np.ndarray:
-    """Derange rows of a (B,k) neighbour-index array: every query gets
-    another query's neighbour list (roll by 1 along the batch axis)."""
-    if len(idx2d) < 2:
-        return idx2d
-    return np.roll(idx2d, 1, axis=0)
+def derange(idx2d: np.ndarray, logs: np.ndarray,
+            rng: np.random.Generator = None) -> np.ndarray:
+    """Assign every query another query's neighbour list: random
+    permutation with perm[i] != i and logs[perm[i]] != logs[i] (a plain
+    roll would hand each scene its adjacent frames' near-identical
+    neighbours and the 'wrong memory' control would be a no-op).
+
+    Rows that cannot find a different-log partner keep their own list.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    logs = np.asarray(logs)
+    n = len(idx2d)
+    out = np.asarray(idx2d).copy()
+    perm = np.arange(n)
+    if n < 2:
+        return out
+    # candidate permutation: random derangement, retry to satisfy
+    # cross-log + no-fixed-point constraints
+    for _ in range(100):
+        p = rng.permutation(n)
+        ok = (p != np.arange(n)) & (logs[p] != logs)
+        if ok.all():
+            perm = p
+            break
+    else:
+        p = perm
+        ok = np.zeros(n, bool)
+    # rows still bad: swap with a random different-log partner
+    bad = np.where(~((p != np.arange(n)) & (logs[p] != logs)))[0]
+    for i in bad:
+        cands = np.where((np.arange(n) != i) & (logs != logs[i]))[0]
+        cands = cands[cands != p[i]]
+        if len(cands):
+            j = cands[rng.integers(len(cands))]
+            p[i], p[j] = p[j], p[i]
+    good = (p != np.arange(n)) & (logs[p] != logs)
+    perm[good] = p[good]
+    return out[perm]

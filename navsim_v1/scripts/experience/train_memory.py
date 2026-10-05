@@ -158,7 +158,8 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
         raise ValueError(key_mode)
 
     if shuffle:
-        nb = derange(nb)            # every scene gets another scene's list
+        # every scene gets a different-log scene's neighbour list
+        nb = derange(nb, logs, rng=np.random.default_rng(seed))
 
     g = bank.gather(nb)
     B, kk, K = g["sub"].shape[:3]
@@ -291,7 +292,8 @@ def main():
                 Kq = b["sub"].shape[1]
                 pad = ~valid[:, :, None].expand(-1, -1, Kq).reshape(B, -1)
                 # memory dropout p=0.2 as extra pad-mask entries
-                pad = pad | (torch.rand(pad.shape, device=device) < P_DROP)
+                drop = torch.rand(pad.shape, device=device) < P_DROP
+                pad = pad | drop
 
                 at = b["a"].to(device)
                 yf = b["yhat"].to(device).flatten(2)
@@ -314,10 +316,13 @@ def main():
                 # memory-dependence constraint: deranged neighbours
                 # (same 'wrong memory' semantics as eval shuffle arm)
                 if args.lam_c > 0:
-                    nb_shuf = derange(nb_s)
+                    nb_shuf = derange(nb_s, q_logs)
                     gs = bank.gather(nb_shuf)
                     mem_s = make_memory_tokens(memenc, gs, device)
-                    dl_s = delta(at, yf, mem_s, pad_mask=pad)
+                    valid_s = torch.from_numpy(gs["valid"]).to(device)
+                    pad_s = ~valid_s[:, :, None].expand(-1, -1, Kq)
+                    pad_s = pad_s.reshape(B, -1) | drop   # same dropout draw
+                    dl_s = delta(at, yf, mem_s, pad_mask=pad_s)
                     sc_s = score_with_delta(b["b0"].to(device), dl_s)
                     l_s = listwise_ce(sc_s, final, weight=hw)
                     lc = F.relu(MU - (l_s - lce))

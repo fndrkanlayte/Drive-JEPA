@@ -137,6 +137,23 @@ def test_shuffle_semantics():
     assert not torch.allclose(d0, d2, atol=1e-4)
 
 
+def test_derange_cross_log():
+    """Log-sorted input: every row must receive a different-log row."""
+    from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (
+        derange,
+    )
+    rng = np.random.default_rng(0)
+    # 4 logs x 4 consecutive frames (sorted like CacheDataset items)
+    logs = np.repeat([f"log{i}" for i in range(4)], 4)
+    nb = np.arange(16 * 8).reshape(16, 8)
+    out = derange(nb, logs, rng)
+    # reconstruct which source row each output row came from
+    src = np.array([np.where((nb == out[i]).all(1))[0][0]
+                    for i in range(16)])
+    assert (src != np.arange(16)).all()
+    assert (logs[src] != logs).all()
+
+
 def test_pad_mask_full_row_gives_zero_delta():
     delta = MemoryDelta()
     torch.nn.init.normal_(delta.out.weight, std=0.1)
