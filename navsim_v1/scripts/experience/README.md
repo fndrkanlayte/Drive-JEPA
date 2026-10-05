@@ -171,3 +171,25 @@ Metrics per subset x tertile (95% CI by scene bootstrap):
 - top-1 unsafe rate: fraction of scenes where the argmin-risk (or
   argmax-pdm) pick has NC<1 or TTC<1.
 - n scenes, n positive candidates per label.
+
+## EWM-JEPA Step 2: latent + outcome caches (new direction)
+
+Frozen-encoder latent cache for the Experience-Conditioned Latent World Model:
+
+- `export_latents.py` — per-scene `<log>/<token>.npz` with `image_feature`
+  (512,256) f16 (scene-level z_t), `bev_feature` (32,8,256) f16,
+  `proposal_feature`, `proposals`, `pred_logit`, `pdm_score`, `ego_status`,
+  `trajectory` (expert), `lidar2img`, `img_shape` (both needed to rebuild the
+  backbone tuple for external scoring). Resumable, sharded by log.
+- `experience/world_model.py` — `score_external_trajectories(model,
+  image_feature, ego_status, trajs)`: scores arbitrary trajectories by
+  re-running the shared `Bev_refiner` rounds with `pose=tau_ext` on a cached
+  `image_feature`; `pack_image_feature` rebuilds the backbone tuple from npz.
+- `test_score_external.py` — verifies argmax agreement >=99% when fed the
+  model's own proposals, plus a reversed-poses control.
+- `compute_anchor_subscores.py` — per-scene (n_anchor,6) PDM subscores over
+  the 8192-anchor vocabulary (v1 port of calc_anchors_scores, no
+  scores_index dependency). CPU/multiprocess/resumable; `--anchor_subset` for
+  a fixed random subset.
+- `build_future_map.py` — token -> ~+4s same-log token map from
+  `ego_state.time_point.time_us` (for z_{t+H} targets); reports coverage.
