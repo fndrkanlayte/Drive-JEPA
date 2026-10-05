@@ -41,6 +41,13 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm import (  # noqa: 
     N_SUB,
     vicreg_var_cov,
 )
+from navsim.agents.drive_jepa_perception_based.experience.ewm_structured import (  # noqa: E402
+    B1Aux,
+    EWMStructured,
+    agent_targets,
+    b1aux_loss,
+    b3_loss,
+)
 from navsim.agents.drive_jepa_perception_based.experience.records import load_npz  # noqa: E402
 
 TIMING_IDX = np.array([DESCRIPTOR_FIELD_INDEX[f] for f in TIMING_FIELDS])
@@ -66,7 +73,11 @@ def outcome_features(labels: dict) -> np.ndarray:
 
 
 class LatentDataset(Dataset):
-    def __init__(self, tokens, lat_index: dict, labels_dir: Path):
+    def __init__(self, tokens, lat_index: dict, labels_dir: Path,
+                 structured: bool = False, future_map: dict = None):
+        self.structured = structured
+        self.future_map = future_map
+        self.lat_index = lat_index
         self.items = []
         labels_dir = Path(labels_dir)
         for t in tokens:
@@ -82,7 +93,26 @@ class LatentDataset(Dataset):
         token, lat_path, lab_path = self.items[i]
         lat = load_npz(lat_path)
         lab = load_npz(lab_path)
+        extra = {}
+        if self.structured:
+            vals, valid, slot = agent_targets(lab["descriptors"], lab["vehicle_mask"])
+            extra.update(agent_vals=vals, agent_valid=valid, agent_slot=slot)
+            if "trajectory" in lat:
+                extra.update(expert_traj=np.asarray(lat["trajectory"], dtype=np.float32),
+                             has_traj=np.float32(1.0))
+            else:
+                extra.update(expert_traj=np.zeros((8, 3), np.float32), has_traj=np.float32(0.0))
+        if self.future_map is not None:
+            ft = self.future_map.get(token, {}).get("future_token")
+            fp = self.lat_index.get(ft) if ft else None
+            if fp is not None:
+                extra.update(image_future=np.asarray(load_npz(fp)["image_feature"], dtype=np.float32),
+                             has_future=np.float32(1.0))
+            else:
+                extra.update(image_future=np.zeros_like(np.asarray(lat["image_feature"], dtype=np.float32)),
+                             has_future=np.float32(0.0))
         return dict(
+            **extra,
             token=token,
             log_name=str(lat["log_name"]),
             image_feature=np.asarray(lat["image_feature"], dtype=np.float32),
@@ -103,8 +133,15 @@ def build_index(latents_dir: Path) -> dict:
     return idx
 
 
+OPTIONAL_KEYS = ["agent_vals", "agent_valid", "agent_slot", "expert_traj", "has_traj",
+                 "image_future", "has_future"]
+
+
 def collate(batch):
+    extra = {k: torch.from_numpy(np.stack([b[k] for b in batch]))
+             for k in OPTIONAL_KEYS if k in batch[0]}
     return dict(
+        **extra,
         tokens=[b["token"] for b in batch],
         log_names=[b["log_name"] for b in batch],
         image_feature=torch.from_numpy(np.stack([b["image_feature"] for b in batch])),
@@ -148,8 +185,8 @@ def evaluate(model, loader, device, direct: bool) -> dict:
         tr = b["proposals"].to(device, non_blocking=True)
         labels = b["labels"].numpy()                      # (B,K,6)
         out = model(img, pf, tr)
-        logits = out["logits"] if direct else out["readout"]
-        probs = torch.sigmoid(logits).cpu().numpy()          # (B,K,6)
+        logits = out["logits"] if "logits" in out else out["readout"]
+        probs = torch.sigmoid(logits).float().cpu().numpy()  # (B,K,6)
         final = probs[..., 5]
         sel = final.argmax(1)
         nat = b["pdm_score"].numpy().argmax(1)
@@ -176,13 +213,23 @@ def evaluate(model, loader, device, direct: bool) -> dict:
     )
 
 
+def build_model(name: str, n_layers: int, use_future: bool = False):
+    if name in ("b1", "b2"):
+        return EWMJEPA(n_layers=n_layers, direct=(name == "b1"))
+    if name == "b1aux":
+        return B1Aux(n_layers=n_layers)
+    if name == "b3":
+        return EWMStructured(n_layers=n_layers, use_future=use_future)
+    raise ValueError(name)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--latents_dir", required=True)
     p.add_argument("--labels_dir", required=True)
     p.add_argument("--train_tokens", required=True)
     p.add_argument("--val_tokens", required=True)
-    p.add_argument("--model", choices=["b1", "b2"], required=True)
+    p.add_argument("--model", choices=["b1", "b2", "b1aux", "b3"], required=True)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch_size", type=int, default=16)
@@ -192,6 +239,11 @@ def main() -> None:
     p.add_argument("--n_layers", type=int, default=3)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--max_train_tokens", type=int, default=None)
+    p.add_argument("--future_map", default=None,
+                   help="b3 only: build_future_map.py JSON for the z_{t+H} loss")
+    p.add_argument("--lam_rel", type=float, default=0.5)
+    p.add_argument("--lam_fut", type=float, default=0.5)
+    p.add_argument("--lam_aux", type=float, default=0.5)
     p.add_argument("--out_dir", required=True)
     args = p.parse_args()
 
@@ -208,8 +260,16 @@ def main() -> None:
     print(f"[train] indexing latents in {args.latents_dir}", flush=True)
     lat_index = build_index(Path(args.latents_dir))
     labels_dir = Path(args.labels_dir)
-    train_ds = LatentDataset(train_tokens, lat_index, labels_dir)
-    val_ds = LatentDataset(val_tokens, lat_index, labels_dir)
+    structured = args.model in ("b1aux", "b3")
+    fmap = None
+    if args.model == "b3" and args.future_map:
+        fmap = json.load(open(args.future_map))["map"]
+    train_ds = LatentDataset(train_tokens, lat_index, labels_dir, structured, fmap)
+    val_ds = LatentDataset(val_tokens, lat_index, labels_dir, structured, None)
+    if fmap is not None:
+        n_fut = sum(1 for t, _, _ in train_ds.items
+                    if fmap.get(t, {}).get("future_token") in lat_index)
+        print(f"[train] future-latent coverage: {n_fut}/{len(train_ds)}", flush=True)
     print(f"[train] train={len(train_ds)} val={len(val_ds)} (labels-joined)", flush=True)
     assert len(train_ds) > 0 and len(val_ds) > 0
 
@@ -221,7 +281,7 @@ def main() -> None:
                             pin_memory=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EWMJEPA(n_layers=args.n_layers, direct=(args.model == "b1")).to(device)
+    model = build_model(args.model, args.n_layers, use_future=fmap is not None).to(device)
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                             lr=args.lr, weight_decay=args.wd)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
@@ -238,11 +298,18 @@ def main() -> None:
             tr = b["proposals"].to(device, non_blocking=True)
             o = b["outcomes"].to(device, non_blocking=True)     # (B,K,18)
             labels = b["labels"].to(device, non_blocking=True).clamp(0, 1)
+            bd = {k: b[k].to(device, non_blocking=True) for k in OPTIONAL_KEYS if k in b}
+            bd["labels"] = labels
 
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
                 out = model(img, pf, tr)
-                if args.model == "b1":
+                if args.model == "b1aux":
+                    loss, parts = b1aux_loss(out, bd, lam_aux=args.lam_aux)
+                elif args.model == "b3":
+                    loss, parts = b3_loss(model, out, bd, lam_rel=args.lam_rel,
+                                          lam_fut=args.lam_fut)
+                elif args.model == "b1":
                     loss = F.binary_cross_entropy_with_logits(out["logits"], labels)
                     parts = {"bce": loss.item()}
                 else:
@@ -259,18 +326,18 @@ def main() -> None:
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-            if args.model == "b2":
+            if args.model in ("b2", "b3"):
                 model.update_ema(args.ema_m)
             for k, v in parts.items():
                 losses[k] = losses.get(k, 0.0) + v
             nb += 1
-        metrics = evaluate(model, val_loader, device, direct=(args.model == "b1"))
+        metrics = evaluate(model, val_loader, device, direct=(args.model in ("b1", "b1aux")))
         row = {"epoch": epoch, "secs": round(time.time() - t0, 1),
                **{k: round(v / nb, 4) for k, v in losses.items()}, **metrics}
         history.append(row)
         print(f"[train] {row}", flush=True)
 
-    torch.save({"model": model.state_dict(), "args": vars(args)},
+    torch.save({"model": model.state_dict(), "args": {**vars(args), "use_future": fmap is not None}},
                out_dir / "model.pt")
     (out_dir / "history.json").write_text(json.dumps(history, indent=1))
     print(f"[train] saved {out_dir}/model.pt")
