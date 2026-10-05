@@ -65,6 +65,7 @@ def main():
     feature_builders = agent.get_feature_builders()
 
     n_match = 0
+    n_all_match = 0
     n_total = 0
     n_ctrl_match = 0
     corrs = []
@@ -93,29 +94,35 @@ def main():
         with torch.no_grad():
             image_feature, ego_last = native_image_feature(agent._pad_model, batch)
             logit_ext, pdm_ext = score_external_trajectories(
-                agent._pad_model, image_feature, ego_last, proposals
+                agent._pad_model, image_feature, ego_last, proposals, mode="last"
+            )
+            _, pdm_all = score_external_trajectories(
+                agent._pad_model, image_feature, ego_last, proposals, mode="all"
             )
         pdm_ext = pdm_ext[0].cpu().numpy()
 
         arg_native = int(pdm_native.argmax())
         arg_ext = int(pdm_ext.argmax())
         n_match += int(arg_native == arg_ext)
+        n_all_match += int(pdm_all[0].cpu().numpy().argmax() == arg_native)
         corrs.append(np.corrcoef(pdm_native, pdm_ext)[0, 1])
 
         # control: reversed-pose proposals should NOT reproduce the argmax
-        tr_rev = proposals.clone()[:, :, ::-1]
+        tr_rev = torch.flip(proposals, dims=[2])
         with torch.no_grad():
             _, pdm_rev = score_external_trajectories(
-                agent._pad_model, image_feature, ego_last, tr_rev
+                agent._pad_model, image_feature, ego_last, tr_rev, mode="last"
             )
         n_ctrl_match += int(pdm_rev[0].cpu().numpy().argmax() == arg_native)
         n_total += 1
 
     agree = n_match / max(n_total, 1)
+    agree_all = n_all_match / max(n_total, 1)
     ctrl = n_ctrl_match / max(n_total, 1)
     mean_corr = float(np.nanmean(corrs))
     print(f"[score_external] scenes scored: {n_total} (tried {tokens_tried})")
-    print(f"[score_external] own-proposal argmax agreement: {agree*100:.1f}%  (need >=99%)")
+    print(f"[score_external] own-proposal argmax agreement (mode=last): {agree*100:.1f}%  (need >=99%)")
+    print(f"[score_external] own-proposal argmax agreement (mode=all):  {agree_all*100:.1f}%")
     print(f"[score_external] Pearson corr(pdm_native, pdm_ext): {mean_corr:.4f}")
     print(f"[score_external] control reversed-poses argmax agreement: {ctrl*100:.1f}% (expect low)")
     if agree < 0.99:

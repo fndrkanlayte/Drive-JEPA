@@ -54,6 +54,7 @@ def score_external_trajectories(
     ego_status_last: torch.Tensor,
     trajectories: torch.Tensor,
     chunk: int = 32,
+    mode: str = "last",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Score externally supplied trajectories with a frozen DriveJEPAModel.
 
@@ -67,6 +68,15 @@ def score_external_trajectories(
                            [pose(3), vel(2), acc(2), command(4)]. Zero cols
                            1:3 yourself first if the model was trained b2d.
         trajectories:      (B, N, num_poses, 3) ego-frame poses to score.
+        mode:
+            "last" (default): rounds 1..ref_num-1 refine natively
+                (pose = traj_decoder(bev), as in the model), and only the
+                LAST round conditions on tau_ext. Feeding the model's own
+                final proposals reproduces the native logits exactly.
+            "all": every round conditions on tau_ext. More invasive
+                conditioning; own-proposal argmax agreement ~86% (scores
+                still ~0.997 correlated) because the model's decoding
+                trajectory shifts slightly.
 
     Returns:
         pred_logit:  (B, N, 6) raw scorer logits [NC,DAC,EP,TTC,Comfort,final]
@@ -96,8 +106,14 @@ def score_external_trajectories(
             tr = torch.cat([tr, pad], dim=1)
 
         bev = bev0
-        for refiner in model._trajectory_head:
-            bev = refiner.Bev_refiner(tr.reshape(B, -1, model.state_size), bev, image_feature)
+        refiners = list(model._trajectory_head)
+        for r, refiner in enumerate(refiners):
+            if mode == "all" or r == len(refiners) - 1:
+                pose = tr.reshape(B, -1, model.state_size)
+            else:
+                # native refinement: poses decoded from the current bev state
+                pose = refiner.traj_decoder(bev).reshape(B, -1, model.state_size)
+            bev = refiner.Bev_refiner(pose, bev, image_feature)
 
         proposal_feature = bev.reshape(B, proposal_num, num_poses, -1).amax(-2)
         logit = model.scorer.pred_score(proposal_feature).reshape(B, proposal_num, -1)
