@@ -78,6 +78,51 @@ def infer(model, loader, device, direct):
     return rows
 
 
+@torch.no_grad()
+def embed(model, loader, device):
+    """-> z_pool (S,D), a (S,K,D), labels (S,K,6), outcomes, log_names, pdm."""
+    zs, aa, ll, oo, lg, pp = [], [], [], [], [], []
+    for b in loader:
+        img = b["image_feature"].to(device)
+        pf = b["proposal_feature"].to(device)
+        tr = b["proposals"].to(device)
+        a, z = model.forward_trunk(img, pf, tr)
+        zs.append(z.mean(1).cpu().numpy())
+        aa.append(a.cpu().numpy())
+        ll.append(b["labels"].numpy())
+        oo.append(b["outcomes"].numpy())
+        lg.extend(b["log_names"])
+        pp.append(b["pdm_score"].numpy())
+    return (np.concatenate(zs), np.concatenate(aa), np.concatenate(ll),
+            np.concatenate(oo), np.asarray(lg), np.concatenate(pp))
+
+
+def lknn_probs(q_z, q_a, q_logs, b_z, b_a, b_lab, b_logs, k: int = 8):
+    """L-kNN: per query scene retrieve k=8 train neighbours by cosine on
+    pooled z (same log excluded), then score each candidate with the label
+    of its nearest neighbour in the joint (z, a_k) embedding."""
+    S, K, D = q_a.shape
+    qz_n = q_z / (np.linalg.norm(q_z, axis=1, keepdims=True) + 1e-8)
+    bz_n = b_z / (np.linalg.norm(b_z, axis=1, keepdims=True) + 1e-8)
+    sim = qz_n @ bz_n.T                                    # (S,T)
+    probs = np.zeros((S, K, b_lab.shape[-1]), dtype=np.float32)
+    for i in range(S):
+        s = sim[i].copy()
+        s[b_logs == q_logs[i]] = -np.inf
+        nb = np.argpartition(-s, k)[:k]                    # k neighbour scenes
+        nb_a = b_a[nb].reshape(-1, D)                      # (k*K, D)
+        nb_z = np.repeat(b_z[nb], K, axis=0)               # (k*K, D)
+        nb_joint = np.concatenate([nb_z, nb_a], axis=-1)   # (k*K, 2D)
+        nb_lab = b_lab[nb].reshape(-1, b_lab.shape[-1])    # (k*K, 6)
+        q_joint = np.concatenate(
+            [np.repeat(q_z[i:i + 1], K, axis=0), q_a[i]], axis=-1)  # (K, 2D)
+        nj = nb_joint / (np.linalg.norm(nb_joint, axis=1, keepdims=True) + 1e-8)
+        qj = q_joint / (np.linalg.norm(q_joint, axis=1, keepdims=True) + 1e-8)
+        nn = (qj @ nj.T).argmax(1)                         # (K,)
+        probs[i] = nb_lab[nn]
+    return probs
+
+
 def scene_desc(outcomes: np.ndarray) -> np.ndarray:
     """Scene descriptor = mean over candidates of the 12 timing features."""
     return np.nanmean(outcomes[:, : len(TIMING_FIELDS)], axis=0)  # (12,)
@@ -111,6 +156,9 @@ def main() -> None:
                    help="latents dir of train reference (navtest mode)")
     p.add_argument("--ref_labels_dir", default=None)
     p.add_argument("--runs", required=True, help="comma-separated run dirs")
+    p.add_argument("--lknn", action="store_true",
+                   help="also score L-kNN (needs a B1 run in --runs)")
+    p.add_argument("--lknn_k", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--out_json", default=None)
@@ -149,6 +197,8 @@ def main() -> None:
     ds = LatentDataset(tokens, lat_index, Path(args.labels_dir))
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, collate_fn=collate)
+    ref_loader = DataLoader(ref_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, collate_fn=collate)
     desc = np.stack([scene_desc(ds[i]["outcomes"]) for i in range(len(ds))])
     desc = (desc - mu) / sd
     density = knn_mean_dist(desc, ref_desc, KNN_Q)
@@ -214,6 +264,33 @@ def main() -> None:
         nat_res = {nm: sel_metrics(sel_native, m) for nm, m in subsets.items()}
         res["selection_model"] = sel_res
         res["selection_native"] = nat_res
+
+        # L-kNN baseline (uses the B1 model's embeddings) ---------------------
+        if args.lknn and direct:
+            print(f"[lknn] embedding bank from {run}", flush=True)
+            b_z, b_a, b_lab, _, b_logs, _ = embed(model, ref_loader, device)
+            q_z, q_a, _, _, q_logs, _ = embed(model, loader, device)
+            kp = lknn_probs(q_z, q_a, q_logs, b_z, b_a, b_lab, b_logs,
+                            k=args.lknn_k)
+            sel_knn = kp[..., 5].argmax(1)
+            p_flat_k = kp.reshape(-1, kp.shape[-1])
+            kres = {}
+            for name, mask in [("all", np.ones(S * K, bool)),
+                               ("tert0", dens_flat == 0),
+                               ("tert1", dens_flat == 1),
+                               ("tert2", dens_flat == 2)]:
+                kres[name] = dict(
+                    nc_auprc=auprc(1 - p_flat_k[mask, 0], l_flat[mask, 0] < 1),
+                    ttc_auprc=auprc(1 - p_flat_k[mask, 3], l_flat[mask, 3] < 1),
+                    spearman=spearman(p_flat_k[mask, 5], l_flat[mask, 5]),
+                )
+            kres["top1_unsafe_model"] = float(np.mean(
+                labels[np.arange(S), sel_knn, 0] < 1))
+            kres["selection_model"] = {
+                nm: sel_metrics(sel_knn, m) for nm, m in subsets.items()}
+            report[f"lknn_{tag}"] = kres
+            print(f"[lknn] nc_auprc={kres['all']['nc_auprc']:.4f} "
+                  f"top1_unsafe={kres['top1_unsafe_model']:.4f}", flush=True)
 
         # alpha blend scan (navtest) -------------------------------------------------
         if args.mode == "navtest":

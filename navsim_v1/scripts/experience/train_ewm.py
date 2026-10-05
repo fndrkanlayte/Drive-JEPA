@@ -84,6 +84,7 @@ class LatentDataset(Dataset):
         lab = load_npz(lab_path)
         return dict(
             token=token,
+            log_name=str(lat["log_name"]),
             image_feature=np.asarray(lat["image_feature"], dtype=np.float32),
             proposal_feature=np.asarray(lat["proposal_feature"], dtype=np.float32),
             proposals=np.asarray(lat["proposals"], dtype=np.float32),
@@ -105,6 +106,7 @@ def build_index(latents_dir: Path) -> dict:
 def collate(batch):
     return dict(
         tokens=[b["token"] for b in batch],
+        log_names=[b["log_name"] for b in batch],
         image_feature=torch.from_numpy(np.stack([b["image_feature"] for b in batch])),
         proposal_feature=torch.from_numpy(np.stack([b["proposal_feature"] for b in batch])),
         proposals=torch.from_numpy(np.stack([b["proposals"] for b in batch])),
