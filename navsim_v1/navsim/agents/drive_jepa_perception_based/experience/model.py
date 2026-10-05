@@ -13,6 +13,9 @@ Variants (same encoder + head capacity, heads differ only by input width):
   retrieval_int  -- retrieval + L_int aux head on the latent predicting the
                     no-att main-vehicle descriptor (training-side labels only)
   shuffle        -- eval-time control: retrieval model, shuffled memory labels
+  pred_desc_*    -- deployable retrieval: a descriptor head predicts the
+                    no-att main-vehicle timing descriptor from the latent;
+                    retrieval then runs in descriptor space
 """
 
 from typing import Optional, Tuple
@@ -77,27 +80,51 @@ class InteractionHead(nn.Module):
         return self.net(z)
 
 
+class DescHead(nn.Module):
+    """Descriptor predictor: latent -> timing-descriptor vector (D dims).
+
+    Deployable counterpart of the GT descriptors: memory/query descriptors
+    used at retrieval time come from THIS head for pred-vs-pred variants.
+    """
+
+    def __init__(self, latent: int = 64, hidden: int = 64, out_dim: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
 class ExperienceModel(nn.Module):
-    """Encoder + risk head + optional interaction head."""
+    """Encoder + risk head + optional interaction / descriptor heads."""
 
     def __init__(self, feat_in_dim: int, head_in_dim: int, use_int: bool = False,
-                 hidden: int = 128, latent: int = 64, head_hidden: int = 64):
+                 desc_dim: int = 0, hidden: int = 128, latent: int = 64,
+                 head_hidden: int = 64):
         super().__init__()
         self.encoder = ExperienceEncoder(feat_in_dim, hidden, latent)
         self.head = RiskHead(head_in_dim, head_hidden)
         self.int_head = InteractionHead(latent, head_hidden) if use_int else None
+        self.desc_head = DescHead(latent, head_hidden, desc_dim) if desc_dim else None
 
     def forward(
         self, x: torch.Tensor, exp: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """x: (B, feat_in_dim) raw inputs; exp: (B, exp_dim) experience features.
 
-        :return: (logits (B,2), latent (B,64), aux (B,8) or None)
+        :return: (logits (B,2), latent (B,64), aux (B,8) or None,
+                  desc (B,D) or None)
         """
         z = self.encoder(x)
         logits = self.head(torch.cat([z, exp], dim=-1))
         aux = self.int_head(z) if self.int_head is not None else None
-        return logits, z, aux
+        desc = self.desc_head(z) if self.desc_head is not None else None
+        return logits, z, aux, desc
 
 
 def encode_rows(model: ExperienceModel, x: torch.Tensor, batch: int = 4096,
@@ -108,4 +135,16 @@ def encode_rows(model: ExperienceModel, x: torch.Tensor, batch: int = 4096,
     with torch.no_grad():
         for i in range(0, len(x), batch):
             outs.append(model.encoder(x[i:i + batch].to(device)).cpu().numpy())
+    return np.concatenate(outs).astype(np.float32)
+
+
+def desc_rows(model: ExperienceModel, x: torch.Tensor, batch: int = 4096,
+              device: str = "cpu") -> np.ndarray:
+    """Predicted descriptor vectors in chunks -> (N, desc_dim) float32."""
+    model.eval()
+    outs = []
+    with torch.no_grad():
+        for i in range(0, len(x), batch):
+            z = model.encoder(x[i:i + batch].to(device))
+            outs.append(model.desc_head(z).cpu().numpy())
     return np.concatenate(outs).astype(np.float32)

@@ -19,6 +19,16 @@ Variants (``--variants``), all with identical encoder capacity:
                 dt_enter/pet/min_dist). Training-side labels only.
   shuffle       eval-time control: the retrieval models evaluated with globally
                 shuffled memory labels.
+  noexp_int     noexp + the L_int aux head (matched-capacity control for
+                retrieval_int -- is the gain from retrieval or the aux loss?)
+  pred_desc_retrieval     deployable retrieval: a descriptor head trained on
+                query_train predicts the no-att main-vehicle TIMING descriptor
+                from the latent; top-K retrieval runs in descriptor space
+                (query d_hat vs memory TRUE desc); head on [latent, weighted
+                neighbour label mean/var, mean(d_hat - d) on continuous cols,
+                mean neighbour similarity]
+  pred_desc_retrieval_pp  same but the memory side also uses its own
+                PREDICTED descriptors (pred-vs-pred)
 
 Each non-shuffle variant trains with ``--seeds`` (default 3 seeds); reported
 predictions are the per-seed mean. Metrics on query_val: Brier / AUPRC /
@@ -55,15 +65,23 @@ if str(NAVSIM_V1_ROOT) not in sys.path:
 
 from navsim.agents.drive_jepa_perception_based.experience.descriptors import (  # noqa: E402
     DESCRIPTOR_FIELD_INDEX as FI,
+    DESCRIPTOR_FIELDS,
+    TIMING_FIELDS,
+    descriptor_feature_names,
+    descriptor_feature_vector,
 )
 from navsim.agents.drive_jepa_perception_based.experience.knn import (  # noqa: E402
     eval_with_ci,
+    standardize_apply,
+    standardize_fit,
 )
 from navsim.agents.drive_jepa_perception_based.experience.model import (  # noqa: E402
     ExperienceModel,
+    desc_rows,
     encode_rows,
 )
 from navsim.agents.drive_jepa_perception_based.experience.retrieval import (  # noqa: E402
+    desc_retrieval_features,
     exp_dim_for,
     random_features,
     retrieval_features,
@@ -77,7 +95,11 @@ from navsim.agents.drive_jepa_perception_based.experience.records import (  # no
 
 SUB_NC, SUB_TTC = 0, 3
 TARGET_NAMES = ["nc_unsafe", "ttc_bad"]
-VARIANTS = ["noexp", "random", "retrieval", "retrieval_int", "shuffle"]
+VARIANTS = ["noexp", "noexp_int", "random", "retrieval", "retrieval_int",
+            "shuffle", "pred_desc_retrieval", "pred_desc_retrieval_pp"]
+# continuous descriptor cols used for the mean(d_hat - d_i) feature
+DESC_CONT_NAMES = ["dt_enter", "pet", "rel_x", "rel_y", "rel_heading",
+                   "speed", "ego_speed"]
 BASE = {"shuffle": "retrieval"}  # eval-only variants -> trained variant
 
 
@@ -110,7 +132,7 @@ def parse_args():
 def load_rows(labels_dir: Path, export_dir: Path,
               dt_enter_thresh: float = 2.0) -> Dict[str, np.ndarray]:
     """Join label + export npz into per-candidate row arrays."""
-    X, Y, AUX, AUX_MASK = [], [], [], []
+    X, Y, AUX, AUX_MASK, DESC = [], [], [], [], []
     scene_id, log_name, in_subset = [], [], []
     tokens, logs_sc = [], []
     sid = 0
@@ -146,7 +168,15 @@ def load_rows(labels_dir: Path, export_dir: Path,
         conf = md[:, FI["conflict"]] == 1.0
         dte = np.abs(md[:, FI["dt_enter"]])
         subset = has_main & conf & (dte < dt_enter_thresh)
+        ego_speed = float(lab["ego_speed"].item()) if "ego_speed" in lab else np.nan
+        desc = np.stack([
+            descriptor_feature_vector(
+                {f: md[k, i] for i, f in enumerate(DESCRIPTOR_FIELDS)},
+                ego_speed=ego_speed, fields=TIMING_FIELDS)
+            for k in range(K)
+        ])  # (K, D_desc) raw, NaNs preserved
         X.append(x); Y.append(y); AUX.append(aux); AUX_MASK.append(aux_mask)
+        DESC.append(desc)
         scene_id.append(np.full(K, sid)); log_name += [str(lab["log_name"].item())] * K
         in_subset.append(subset)
         tokens.append(str(lab["token"].item()))
@@ -155,6 +185,7 @@ def load_rows(labels_dir: Path, export_dir: Path,
     return dict(
         x=np.concatenate(X), y=np.concatenate(Y),
         aux=np.concatenate(AUX), aux_mask=np.concatenate(AUX_MASK),
+        desc=np.concatenate(DESC),
         scene_id=np.concatenate(scene_id), log=np.asarray(log_name),
         subset=np.concatenate(in_subset),
         tokens=np.asarray(tokens), scene_log=np.asarray(logs_sc),
@@ -165,7 +196,7 @@ def load_rows(labels_dir: Path, export_dir: Path,
 def build_exp(variant: str, q_lat, q_scene, q_log, mem, args, rng,
               shuffle_labels: bool = False) -> np.ndarray:
     """Experience-feature block for a set of query rows."""
-    if variant == "noexp":
+    if variant in ("noexp", "noexp_int"):
         return np.zeros((len(q_lat), 0), dtype=np.float32)
     if variant == "random":
         return random_features(len(q_lat), q_log, mem["y"], mem["log"],
@@ -201,9 +232,98 @@ def predict(model, x_t, exp_np, device, batch=8192):
     with torch.no_grad():
         for i in range(0, len(x_t), batch):
             e = torch.from_numpy(exp_np[i:i + batch]).to(device)
-            logits, _, _ = model(x_t[i:i + batch].to(device), e)
+            logits, _, _, _ = model(x_t[i:i + batch].to(device), e)
             outs.append(torch.sigmoid(logits).cpu().numpy())
     return np.concatenate(outs)
+
+
+def train_pred_desc(variant: str, seed: int, rows: Dict[str, np.ndarray],
+                    mem_rows: Dict[str, np.ndarray], args):
+    """Two-phase pred_desc training (see module docstring).
+
+    Phase 1: encoder + DescHead predict the standardized TRUE no-att timing
+             descriptor on query_train rows (masked MSE).
+    Phase 2: d_hat for queries + memory desc (TRUE or predicted for the _pp
+             variant) -> static descriptor-space retrieval features.
+    Phase 3: encoder frozen; risk head trained on [latent, exp] with BCE.
+    """
+    import torch
+    import torch.nn.functional as TF
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    device = args.device
+    tr = rows["group"] == "query_train"
+    tr_idx = np.flatnonzero(tr)
+    va_idx = np.flatnonzero(rows["group"] == "query_val")
+    q_idx = np.concatenate([tr_idx, va_idx])
+
+    x_all = torch.from_numpy(rows["x"]).float()
+    y_all = torch.from_numpy(rows["y"]).float()
+    desc_z = torch.from_numpy(rows["desc_z"]).float()
+    desc_valid = torch.from_numpy(rows["desc_valid"].astype(np.float32))
+    D_desc = rows["desc_z"].shape[1]
+    latent = 64
+    cont_cols = rows["cont_cols"]
+    exp_dim = exp_dim_for(variant, latent, n_cont=len(cont_cols))
+    model = ExperienceModel(x_all.shape[1], latent + exp_dim,
+                            desc_dim=D_desc).to(device)
+
+    # phase 1: descriptor prediction
+    opt = torch.optim.Adam(
+        list(model.encoder.parameters()) + list(model.desc_head.parameters()),
+        lr=args.lr)
+    for epoch in range(args.epochs):
+        model.train()
+        perm = rng.permutation(len(tr_idx))
+        for i0 in range(0, len(tr_idx), args.batch_size):
+            bi = tr_idx[perm[i0:i0 + args.batch_size]]
+            z = model.encoder(x_all[bi].to(device))
+            d_hat = model.desc_head(z)
+            m = desc_valid[bi].to(device)
+            loss = (TF.mse_loss(d_hat, desc_z[bi].to(device), reduction="none")
+                    * m).sum() / m.sum().clamp(min=1.0)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    # phase 2: static descriptor-space retrieval features
+    use_pred_mem = variant == "pred_desc_retrieval_pp"
+    d_hat_q = desc_rows(model, x_all[q_idx], device=device)
+    if use_pred_mem:
+        mem_desc = desc_rows(model, torch.from_numpy(mem_rows["x"]).float(),
+                             device=device)
+        mem_valid = np.ones_like(mem_desc, dtype=bool)
+    else:
+        mem_desc = mem_rows["desc_z"]
+        mem_valid = mem_rows["desc_valid"]
+    exp = desc_retrieval_features(
+        d_hat_q, rows["scene_id"][q_idx], rows["log"][q_idx],
+        mem_desc, mem_rows["y"], mem_rows["scene_id"], mem_rows["log"],
+        cont_cols, mem_valid, topk=args.topk,
+        max_per_scene=args.max_per_scene, device=args.device)
+
+    # phase 3: freeze encoder, train risk head on [latent, exp]
+    for p_ in model.encoder.parameters():
+        p_.requires_grad_(False)
+    opt = torch.optim.Adam(model.head.parameters(), lr=args.lr)
+    exp_tr = torch.from_numpy(exp[: len(tr_idx)]).float()
+    for epoch in range(args.epochs):
+        model.train()
+        perm = rng.permutation(len(tr_idx))
+        for i0 in range(0, len(tr_idx), args.batch_size):
+            pos = perm[i0:i0 + args.batch_size]
+            bi = tr_idx[pos]
+            logits, _, _, _ = model(x_all[bi].to(device), exp_tr[pos].to(device))
+            loss = TF.binary_cross_entropy_with_logits(
+                logits, y_all[bi].to(device))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    pred = predict(model, x_all[q_idx], exp, device)
+    return {"model": model, "val": pred[len(tr_idx):],
+            "use_pred_mem": use_pred_mem}
 
 
 def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
@@ -211,6 +331,9 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
     """Train one (variant, seed). Returns (model, val_preds, val_preds_shuffle)."""
     import torch
     import torch.nn.functional as TF
+
+    if variant.startswith("pred_desc"):
+        return train_pred_desc(variant, seed, rows, mem_rows, args)
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -224,7 +347,7 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
     auxm_all = torch.from_numpy(rows["aux_mask"]).bool()
 
     latent = 64
-    use_int = variant == "retrieval_int"
+    use_int = variant in ("retrieval_int", "noexp_int")
     model = ExperienceModel(x_all.shape[1], latent + exp_dim_for(variant, latent),
                             use_int=use_int).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -262,7 +385,7 @@ def train_one(variant: str, seed: int, rows: Dict[str, np.ndarray],
             bi = tr_idx[pos]
             xb = x_all[bi].to(device)
             eb = exp_tr[pos].to(device)
-            logits, z, aux_out = model(xb, eb)
+            logits, z, aux_out, _ = model(xb, eb)
             loss = TF.binary_cross_entropy_with_logits(logits, y_all[bi].to(device))
             if use_int and aux_out is not None:
                 loss = loss + args.aux_weight * aux_loss_fn(
@@ -299,6 +422,20 @@ def predict_navtest(model, variant: str, nt: Dict[str, np.ndarray],
     rng = np.random.default_rng(seed + 9000)
     mem_x = torch.from_numpy(mem_rows["x"]).float()
     nt_x = torch.from_numpy(nt["x"]).float()
+    if variant.startswith("pred_desc"):
+        d_hat_nt = desc_rows(model, nt_x, device=device)
+        if variant == "pred_desc_retrieval_pp":
+            mem_desc = desc_rows(model, mem_x, device=device)
+            mem_valid = np.ones_like(mem_desc, dtype=bool)
+        else:
+            mem_desc = mem_rows["desc_z"]
+            mem_valid = mem_rows["desc_valid"]
+        exp = desc_retrieval_features(
+            d_hat_nt, nt["scene_id"], nt["log"], mem_desc, mem_rows["y"],
+            mem_rows["scene_id"], mem_rows["log"], nt["cont_cols"],
+            mem_valid, topk=args.topk, max_per_scene=args.max_per_scene,
+            device=device)
+        return predict(model, nt_x, exp, device)
     mem = {"y": mem_rows["y"], "scene_id": mem_rows["scene_id"],
            "log": mem_rows["log"],
            "latent": encode_rows(model, mem_x, device=device)}
@@ -331,8 +468,19 @@ def main() -> None:
             m = rows["group"] == sp
             print(f"[exp] pos-rate {tname} {sp}: {rows['y'][m, ti].mean():.4f}")
 
+    # descriptor standardization on query_train (pred_desc variants)
+    qtr_mask0 = np.array([group_of[l] for l in rows["log"]]) == "query_train"
+    zm, zs = standardize_fit(rows["desc"][qtr_mask0])
+    rows["desc_valid"] = np.isfinite(rows["desc"])
+    rows["desc_z"] = np.nan_to_num(
+        (rows["desc"] - zm) / zs, nan=0.0).astype(np.float32)
+    names = descriptor_feature_names(TIMING_FIELDS)
+    rows["cont_cols"] = np.array(
+        [names.index(n) for n in DESC_CONT_NAMES], dtype=np.int64)
+
     mem_mask = rows["group"] == "memory"
-    mem_rows = {k: rows[k][mem_mask] for k in ("x", "y", "scene_id", "log")}
+    mem_rows = {k: rows[k][mem_mask] for k in
+                ("x", "y", "scene_id", "log", "desc_z", "desc_valid")}
 
     val_mask = rows["group"] == "query_val"
     val_y = rows["y"][val_mask]
@@ -420,6 +568,10 @@ def main() -> None:
         print("[exp] predicting navtest risks", flush=True)
         nt = load_rows(Path(args.navtest_labels_dir), Path(args.navtest_export_dir),
                        args.dt_enter_thresh)
+        nt["desc_valid"] = np.isfinite(nt["desc"])
+        nt["desc_z"] = np.nan_to_num(
+            (nt["desc"] - zm) / zs, nan=0.0).astype(np.float32)
+        nt["cont_cols"] = rows["cont_cols"]
         risk_dir = out_dir / "navtest_risk"
         n_nt = len(nt["tokens"])
         for variant, seed_runs in runs.items():
