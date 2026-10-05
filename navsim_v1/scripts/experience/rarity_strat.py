@@ -227,17 +227,18 @@ def main() -> None:
         rr, keep = risks[v]
         rh_nc = np.clip(rr[..., 0], 0, 1).ravel()
         rh_ttc = np.clip(rr[..., 1], 0, 1).ravel()
-        keep_r = np.repeat(keep, rr.shape[1])
+        has = np.zeros(S, dtype=bool)
+        has[keep] = True
         for d in range(10):
             lo, hi = dec[d], dec[d + 1]
             dm = ((rare >= lo) & (rare <= hi) if d == 9
                   else (rare >= lo) & (rare < hi))
-            sel_c = np.repeat(dm, rr.shape[1]) & keep_r
+            sel_c = np.repeat(dm & has, rr.shape[1])
             rows_auprc.append([v, f"d{d}",
                                f"{auprc(y_nc[sel_c], rh_nc[sel_c]):.4f}",
                                f"{auprc(y_ttc[sel_c], rh_ttc[sel_c]):.4f}"])
         for sname, keep_x in extra_subsets:
-            sel_c = np.repeat(keep_x, rr.shape[1]) & keep_r
+            sel_c = np.repeat(keep_x & has, rr.shape[1])
             rows_auprc.append([v, sname,
                                f"{auprc(y_nc[sel_c], rh_nc[sel_c]):.4f}",
                                f"{auprc(y_ttc[sel_c], rh_ttc[sel_c]):.4f}"])
