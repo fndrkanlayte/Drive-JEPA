@@ -379,6 +379,8 @@ def main():
         keynet.train(); memenc.train(); delta.train()
         ep_loss = ep_ret = ep_c = ep_main = ep_gn = 0.0
         nb = 0
+        st = dict(lfix=0.0, lkeep=0.0, lkl=0.0, ldr=0.0, lret=0.0, lc=0.0,
+                  n_wrong=0, dstd=0.0, flip=0.0, cnt=0)
         loader = DataLoader(train_ds, batch_size=args.batch_size,
                             shuffle=True, num_workers=args.num_workers,
                             collate_fn=collate_cache, drop_last=True)
@@ -436,11 +438,11 @@ def main():
                 ldr = (dl - dl.mean(1, keepdim=True)).pow(2).mean()
                 b0_t = b["b0"].to(device)
                 if args.loss == "top1":
-                    lcore, _ = top1_loss(scores, b0_t, final,
-                                         lam_kl=args.lam_kl,
-                                         lam_keep=args.lam_keep,
-                                         keep_tol=args.keep_tol,
-                                         fix_mode=args.fix_mode)
+                    lcore, parts = top1_loss(scores, b0_t, final,
+                                             lam_kl=args.lam_kl,
+                                             lam_keep=args.lam_keep,
+                                             keep_tol=args.keep_tol,
+                                             fix_mode=args.fix_mode)
                     lmain = lcore + args.lam_dreg * ldr
                 else:
                     lce = listwise_ce(scores, final, weight=hw)
@@ -474,6 +476,28 @@ def main():
                     lc = F.relu(args.mu - (l_s - l_ref))
                     lmain = lmain + args.lam_c * lc
 
+            if args.loss == "top1" and args.mode in ("joint", "delta_only"):
+                st["lfix"] += float(parts["lfix"])
+                st["lkeep"] += float(parts["lkeep"])
+                st["lkl"] += float(parts["lkl"])
+                st["ldr"] += float(ldr)
+                st["lret"] += float(lret); st["lc"] += float(lc)
+                st["n_wrong"] += parts["n_wrong"]
+                st["dstd"] += float((dl - dl.mean(1, keepdim=True))
+                                   .std(1).mean())
+                st["flip"] += float((scores.argmax(1) != b0_pick)
+                                    .float().mean())
+                st["cnt"] += 1
+                if nb and nb % 100 == 0:
+                    c = st["cnt"]
+                    print(f"[step] ep{ep} nb{nb} lfix={st['lfix']/c:.3f} "
+                          f"lkeep={st['lkeep']/c:.3f} lkl={st['lkl']/c:.3f} "
+                          f"ldr={st['ldr']/c:.3f} lret={st['lret']/c:.3f} "
+                          f"lc={st['lc']/c:.3f} nw={st['n_wrong']/c:.0f} "
+                          f"dstd={st['dstd']/c:.3f} flip={st['flip']/c:.3f}",
+                          flush=True)
+                    st = {k: (0 if k in ("n_wrong", "cnt") else 0.0)
+                          for k in st}
             loss = lmain + args.lam_ret * lret
             opt.zero_grad()
             loss.backward()
