@@ -280,7 +280,7 @@ def make_key(y_full, slot_logit, key, stats=None):
             raise SystemExit("--key pool requires slot_logit (b3 only)")
         y = torch.as_tensor(y_full, dtype=torch.float32)
         sl = torch.as_tensor(slot_logit, dtype=torch.float32)
-        return pool_key(y, sl).numpy()
+        return pool_key(y.unsqueeze(1), sl.unsqueeze(1))[:, 0].numpy()
     ag = (y_full[:, 1:] - stats["ag_mu"]) / stats["ag_sd"]
     if slot_logit is not None:
         p = 1.0 / (1.0 + np.exp(-slot_logit))

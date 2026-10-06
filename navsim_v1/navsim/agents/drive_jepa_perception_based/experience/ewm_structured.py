@@ -244,6 +244,8 @@ def pool_key(y_hat: torch.Tensor, slot_logit: torch.Tensor) -> torch.Tensor:
     y_ego = y_hat[:, :, 0]                                   # (B,K,L)
     y_ag = y_hat[:, :, 1:]                                   # (B,K,M,L)
     w = torch.sigmoid(slot_logit)                            # (B,K,M)
+    if w.shape[-1] != y_ag.shape[-2]:                        # slot_logit may include ego
+        w = w[..., -y_ag.shape[-2]:]
     wsum = w.sum(-1, keepdim=True).clamp_min(1e-6)
     mean_p = (w[..., None] * y_ag).sum(2) / wsum             # (B,K,L)
     max_p = (w[..., None] * y_ag).amax(2)                    # (B,K,L)
