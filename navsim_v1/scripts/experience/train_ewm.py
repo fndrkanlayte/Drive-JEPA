@@ -165,6 +165,8 @@ class LatentDataset(Dataset):
             proposal_feature=np.asarray(lat["proposal_feature"], dtype=np.float32),
             proposals=np.asarray(lat["proposals"], dtype=np.float32),
             pdm_score=np.asarray(lat["pdm_score"], dtype=np.float32),
+            pred_logit=np.asarray(lat["pred_logit"], dtype=np.float32)
+            if "pred_logit" in lat.files else np.zeros((32, 6), np.float32),
             outcomes=outcome_features(lab),
             labels=np.asarray(lab["subscores"], dtype=np.float32),
         )
@@ -194,6 +196,7 @@ def collate(batch):
         proposal_feature=torch.from_numpy(np.stack([b["proposal_feature"] for b in batch])),
         proposals=torch.from_numpy(np.stack([b["proposals"] for b in batch])),
         pdm_score=torch.from_numpy(np.stack([b["pdm_score"] for b in batch])),
+        pred_logit=torch.from_numpy(np.stack([b["pred_logit"] for b in batch])),
         outcomes=torch.from_numpy(np.stack([b["outcomes"] for b in batch])),
         labels=torch.from_numpy(np.stack([b["labels"] for b in batch])),
     )

@@ -54,7 +54,7 @@ from eval_ewm import (  # noqa: E402
 @torch.no_grad()
 def collect_query(model, loader, device):
     """-> y_ego (S,K,L), labels (S,K,6), pdm (S,K), log per scene (S,)."""
-    ys, ll, pp, lg = [], [], [], []
+    ys, ll, pp, lg, pl = [], [], [], [], []
     for b in loader:
         out = model(b["image_feature"].to(device),
                     b["proposal_feature"].to(device),
@@ -62,9 +62,10 @@ def collect_query(model, loader, device):
         ys.append(out["y_hat"][:, :, 0].float().cpu().numpy())
         ll.append(b["labels"].numpy())
         pp.append(b["pdm_score"].numpy())
+        pl.append(b["pred_logit"].numpy())
         lg.extend(b["log_names"])
     return (np.concatenate(ys), np.concatenate(ll), np.concatenate(pp),
-            np.asarray(lg))
+            np.asarray(lg), np.concatenate(pl))
 
 
 @torch.no_grad()
@@ -351,12 +352,15 @@ def main():
     bank = load_bank_npz(args.bank_npz) if args.bank_npz else None
     report = {}
     dump_runs = {}
-    pdm_all, final_all = {}, {}
+    pdm_all, final_all, b0_all, labels_full = {}, {}, {}, {}
     for run in args.runs.split(","):
         model, direct, tag = load_model(Path(run), device, ckpt_file=args.ckpt)
-        y_ego, labels, pdm, q_logs = collect_query(model, q_loader, device)
+        y_ego, labels, pdm, q_logs, pred_logit = collect_query(
+            model, q_loader, device)
         pdm_all[tag] = pdm.copy()
         final_all[tag] = labels[..., 5].copy()
+        labels_full[tag] = labels.copy()
+        b0_all[tag] = (1.0 / (1.0 + np.exp(-pred_logit))).astype(np.float32)
 
         # bank memory: train split B0 proposals
         print(f"[{tag}] collecting train bank ...", flush=True)
@@ -381,12 +385,22 @@ def main():
     if args.dump_npz:
         for tag, dumps in dump_runs.items():
             pth = Path(args.dump_npz.format(tag=tag))
+            pdm_t, final_t = pdm_all[tag], final_all[tag]
+            bw = {}
+            for ks in (2, 4, 8):
+                bw[f"b0_wrong_K{ks}"] = np.array([
+                    final_t[s, pdm_t[s].argmax()] <
+                    final_t[s, topk_indices(pdm_t[s], ks)].max() - 1e-6
+                    for s in range(len(pdm_t))])
             np.savez(
                 pth,
                 tokens=np.asarray(tokens),
                 rare10=rare10.astype(bool),
-                pdm=pdm_all[tag],
-                final=final_all[tag],
+                pdm=pdm_t,
+                final=final_t,
+                subs=labels_full[tag],
+                b0_sub=b0_all[tag],
+                **bw,
                 **{f"{bn}__{k}": v for bn, d in dumps.items()
                    for k, v in d.items()},
             )
