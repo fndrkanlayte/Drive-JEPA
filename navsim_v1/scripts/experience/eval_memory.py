@@ -183,6 +183,10 @@ for arm in arms:
                                                q_ds, device,
                                                key_mode="appearance",
                                                topk=topk)
+    elif arm == "nomem":
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device, key_mode="lret",
+                                               topk=topk, nomem=True)
     elif arm == "random":
         f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
                                                q_ds, device,

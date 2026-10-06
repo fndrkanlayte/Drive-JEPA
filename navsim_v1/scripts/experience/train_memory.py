@@ -124,7 +124,7 @@ def selection_final(scores: np.ndarray, final: np.ndarray) -> float:
 
 def eval_selection(bank, keynet, memenc, delta, ds, device,
                    key_mode="lret", shuffle=False, scale=1.0, seed=0,
-                   topk=0):
+                   topk=0, nomem=False):
     """Vectorised selection eval on a CacheDataset.
     Returns (chosen_final, picks, sub, b0, logs, delta_flat, gate_flat):
     chosen_final (S,), picks (S,) argmax candidate idx, sub (S,K,6),
@@ -190,6 +190,8 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
             valid = torch.from_numpy(gs["valid"]).to(device)
             pad = ~valid[:, :, None].expand(-1, -1, K).reshape(
                 valid.shape[0], -1)
+            if nomem:
+                pad = torch.ones_like(pad)
             at = torch.from_numpy(a[sl]).to(device)
             yf = torch.from_numpy(yh[sl]).to(device).reshape(
                 at.shape[0], at.shape[1], -1)
