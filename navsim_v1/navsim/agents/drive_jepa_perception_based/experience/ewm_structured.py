@@ -256,7 +256,7 @@ def xs_loss(y_ego: torch.Tensor, subs: torch.Tensor, log_ids: torch.Tensor,
     has = w.sum(-1) > 0
     if not bool(has.any()):
         return y.new_zeros(())
-    sim = sim.masked_fill(~allowed, -1e9)
+    sim = sim.float().masked_fill(~allowed, -1e9)
     logp = F.log_softmax(sim, dim=-1)
     tgt = w[has] / w[has].sum(-1, keepdim=True)
     lp = logp[has]
