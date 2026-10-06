@@ -47,7 +47,9 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_structured import 
     agent_targets,
     b1aux_loss,
     b3_loss,
+    pool_key,
     xs_loss,
+    XS_SUB_W,
 )
 from navsim.agents.drive_jepa_perception_based.experience.records import load_npz  # noqa: E402
 
@@ -354,6 +356,10 @@ def main() -> None:
     p.add_argument("--bank_per_scene", type=int, default=16)
     p.add_argument("--lam_xs", type=float, default=0.0,
                    help="cross-scene soft InfoNCE on ego-slot y_hat")
+    p.add_argument("--xs_key", choices=["ego", "pool"], default="ego",
+                   help="pool: xs on slot-invariant pooled agent key (A5c)")
+    p.add_argument("--xs_sub_w", action="store_true",
+                   help="weight subscore L1 by XS_SUB_W (safety x3)")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--traj_jitter", type=float, default=0.0,
                    help="sigma (m) of train-time xy jitter on candidate trajs")
@@ -470,7 +476,12 @@ def main() -> None:
                         lid = torch.as_tensor(
                             np.repeat(inv[:, None], out["y_hat"].shape[1], axis=1),
                             device=device)
-                        xs = xs_loss(out["y_hat"][:, :, 0], labels, lid)
+                        if args.xs_key == "pool":
+                            xkey = pool_key(out["y_hat"], out["slot_logit"])
+                        else:
+                            xkey = out["y_hat"][:, :, 0]
+                        sw = XS_SUB_W if args.xs_sub_w else None
+                        xs = xs_loss(xkey, labels, lid, sub_w=sw)
                         loss = loss + args.lam_xs * xs
                         parts["xs"] = float(xs.detach())
                 elif args.model == "b1":

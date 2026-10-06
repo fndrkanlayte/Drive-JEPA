@@ -230,8 +230,31 @@ def relational_loss_ego(y_ego_hat: torch.Tensor, y_ego_tgt: torch.Tensor) -> tor
     return F.mse_loss(a @ a.transpose(1, 2), b @ b.transpose(1, 2))
 
 
+XS_SUB_W = torch.tensor([3.0, 3.0, 1.0, 3.0, 1.0, 1.0])
+"""Weighted-L1 subscore distance for xs_loss: safety cols NC/DAC/TTC x3."""
+
+
+def pool_key(y_hat: torch.Tensor, slot_logit: torch.Tensor) -> torch.Tensor:
+    """Slot-order-invariant agent key (A5b/c).
+
+    y_hat (B,K,1+M,L), slot_logit (B,K,M) -> (B,K,3L):
+    exist-weighted mean-pool and max-pool over agent slots, concatenated,
+    L2-normalized and appended after the normalized ego slot.
+    """
+    y_ego = y_hat[:, :, 0]                                   # (B,K,L)
+    y_ag = y_hat[:, :, 1:]                                   # (B,K,M,L)
+    w = torch.sigmoid(slot_logit)                            # (B,K,M)
+    wsum = w.sum(-1, keepdim=True).clamp_min(1e-6)
+    mean_p = (w[..., None] * y_ag).sum(2) / wsum             # (B,K,L)
+    max_p = (w[..., None] * y_ag).amax(2)                    # (B,K,L)
+    y_ag_pool = torch.cat([mean_p, max_p], dim=-1)           # (B,K,2L)
+    return torch.cat([F.normalize(y_ego.float(), dim=-1),
+                      F.normalize(y_ag_pool.float(), dim=-1)], dim=-1)
+
+
 def xs_loss(y_ego: torch.Tensor, subs: torch.Tensor, log_ids: torch.Tensor,
-            n_sample: int = 512, tau: float = 0.1, t_s: float = 0.1) -> torch.Tensor:
+            n_sample: int = 512, tau: float = 0.1, t_s: float = 0.1,
+            sub_w: torch.Tensor = None) -> torch.Tensor:
     """Cross-scene soft InfoNCE on the ego-slot outcome latent.
 
     y_ego (B,K,L) candidate latents, subs (B,K,6) true subscores,
@@ -250,7 +273,10 @@ def xs_loss(y_ego: torch.Tensor, subs: torch.Tensor, log_ids: torch.Tensor,
         y, s, lg = y[idx], s[idx], lg[idx]
         n = n_sample
     sim = y @ y.T / tau                                             # (n,n)
-    d = (s[:, None, :] - s[None, :, :]).abs().sum(-1)               # L1 on subscores
+    d = (s[:, None, :] - s[None, :, :]).abs()
+    if sub_w is not None:
+        d = d * sub_w.to(d.device).view(1, 1, -1)
+    d = d.sum(-1)                                                   # weighted L1
     allowed = (lg[:, None] != lg[None, :]) & ~torch.eye(n, dtype=torch.bool, device=y.device)
     w = torch.exp(-d / t_s) * allowed
     has = w.sum(-1) > 0

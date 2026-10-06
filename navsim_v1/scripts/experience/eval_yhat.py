@@ -271,6 +271,16 @@ def make_key(y_full, slot_logit, key, stats=None):
     """
     if key == "ego":
         return y_full[:, 0]
+    if key == "pool":
+        # slot-order-invariant pooled agent key (pre-normalized)
+        import torch
+        from navsim.agents.drive_jepa_perception_based.experience. \
+            ewm_structured import pool_key
+        if slot_logit is None:
+            raise SystemExit("--key pool requires slot_logit (b3 only)")
+        y = torch.as_tensor(y_full, dtype=torch.float32)
+        sl = torch.as_tensor(slot_logit, dtype=torch.float32)
+        return pool_key(y, sl).numpy()
     ag = (y_full[:, 1:] - stats["ag_mu"]) / stats["ag_sd"]
     if slot_logit is not None:
         p = 1.0 / (1.0 + np.exp(-slot_logit))
@@ -416,7 +426,7 @@ def main():
                    choices=("meanstd", "off"),
                    help="ŷ centre+scale by train-memory stats before cosine")
     p.add_argument("--key", default="ego",
-                   choices=("ego", "agent", "ego_agent"),
+                   choices=("ego", "agent", "ego_agent", "pool"),
                    help="retrieval key: ego slot only (default), agent slots "
                         "1..4 whitened+exist-weighted concat, or both")
     p.add_argument("--mem_cache_dir", default=None,

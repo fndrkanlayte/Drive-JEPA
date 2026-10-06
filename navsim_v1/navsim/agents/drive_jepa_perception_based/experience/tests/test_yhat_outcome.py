@@ -377,3 +377,54 @@ def test_combine_select_degenerates_to_b0():
     r = evaluate(z, pun, fhat, 8, 0.0, 0.0, b0_wrong_masks(z))
     np.testing.assert_allclose(r["all"], r["b0_top1"])
     assert r["sw"] == 0.0
+
+
+def test_pool_key_slot_permutation_invariant():
+    """A5c: pool key must not depend on agent slot order."""
+    import numpy as np
+    import torch
+    from navsim.agents.drive_jepa_perception_based.experience. \
+        ewm_structured import pool_key
+    rng = np.random.default_rng(0)
+    B, K, M, L = 2, 4, 4, 8
+    y = torch.as_tensor(rng.normal(size=(B, K, 1 + M, L)), dtype=torch.float32)
+    sl = torch.as_tensor(rng.normal(size=(B, K, M)), dtype=torch.float32)
+    k1 = pool_key(y, sl)
+    perm = torch.randperm(M)
+    y2 = torch.cat([y[:, :, :1], y[:, :, 1:][:, :, perm]], dim=2)
+    k2 = pool_key(y2, sl[:, :, perm])
+    torch.testing.assert_close(k1, k2)
+    # ego half is the normalized slot-0 vector
+    import torch.nn.functional as F
+    torch.testing.assert_close(
+        k1[..., :L], F.normalize(y[:, :, 0], dim=-1))
+
+
+def test_xs_loss_weighted_target():
+    """Weighted-L1 target: a diff in col NC (w=3) vs col Comfort (w=1)
+    gives different xs_loss under XS_SUB_W, identical under uniform w."""
+    import torch
+    from navsim.agents.drive_jepa_perception_based.experience. \
+        ewm_structured import xs_loss, XS_SUB_W
+    rng = np.random.default_rng(1)
+    B, K, L = 4, 8, 16
+    y = torch.as_tensor(rng.normal(size=(B, K, L)), dtype=torch.float32)
+    lid = torch.arange(B)[:, None].expand(B, K).clone()
+    # each row has the same value across all 6 cols -> the distance
+    # matrix is symmetric under a column swap, isolating the weighting.
+    v = rng.random((B, K, 1)).astype(np.float32)
+    base = np.broadcast_to(v, (B, K, 6)).copy()
+
+    def mk(col):
+        s = base.copy()
+        s[0, 0, col] += 0.2
+        return torch.as_tensor(s, dtype=torch.float32)
+
+    def call(s, w=None):
+        torch.manual_seed(0)   # identical randperm subsample each call
+        return xs_loss(y, s, lid, n_sample=4096, sub_w=w)
+
+    la, lb = call(mk(0), XS_SUB_W), call(mk(4), XS_SUB_W)
+    assert not torch.isclose(la, lb)              # weights applied
+    ua, ub = call(mk(0)), call(mk(4))
+    torch.testing.assert_close(ua, ub)            # unweighted symmetric
