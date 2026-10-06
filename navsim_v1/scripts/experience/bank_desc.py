@@ -122,6 +122,9 @@ def check_consistency(export_dir, labels_dir, cache_map, n_scenes, top_m,
             break
         tok = lf.stem
         rec_f = export_dir / f"{tok}.npz"
+        if not rec_f.exists():
+            hits = list(export_dir.rglob(f"{tok}.npz"))
+            rec_f = hits[0] if hits else rec_f
         if tok not in cache_map or not rec_f.exists():
             continue
         rec = np.load(rec_f, allow_pickle=True)
