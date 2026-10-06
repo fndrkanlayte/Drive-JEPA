@@ -55,6 +55,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (  #
     retrieval_kl,
     score_with_delta,
     top1_loss,
+    topk_scores,
 )
 
 MU = 0.05          # memory-dependence margin
@@ -122,11 +123,13 @@ def selection_final(scores: np.ndarray, final: np.ndarray) -> float:
 
 
 def eval_selection(bank, keynet, memenc, delta, ds, device,
-                   key_mode="lret", shuffle=False, scale=1.0, seed=0):
+                   key_mode="lret", shuffle=False, scale=1.0, seed=0,
+                   topk=0):
     """Vectorised selection eval on a CacheDataset.
-    Returns (chosen_final, picks, sub, b0, logs, delta_flat):
+    Returns (chosen_final, picks, sub, b0, logs, delta_flat, gate_flat):
     chosen_final (S,), picks (S,) argmax candidate idx, sub (S,K,6),
-    b0 (S,K), logs (S,), delta_flat (S,K) raw Delta values."""
+    b0 (S,K), logs (S,), delta_flat (S,K) raw Delta values,
+    gate_flat (S,) gate values or NaN when gate disabled."""
     keynet.eval(); memenc.eval(); delta.eval()
     key, zp, a, yh, sub, b0, logs = [], [], [], [], [], [], []
     for b in DataLoader(ds, batch_size=64, shuffle=False, num_workers=4,
@@ -176,6 +179,7 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
     finals = np.zeros(B, np.float32)
     picks = np.zeros(B, np.int64)
     dflat = np.zeros((B, K), np.float32)
+    gflat = np.full(B, np.nan, np.float32)
     chunk = 128
     with torch.no_grad():
         for s in range(0, B, chunk):
@@ -189,13 +193,16 @@ def eval_selection(bank, keynet, memenc, delta, ds, device,
             at = torch.from_numpy(a[sl]).to(device)
             yf = torch.from_numpy(yh[sl]).to(device).reshape(
                 at.shape[0], at.shape[1], -1)
-            dl = delta(at, yf, mem, pad_mask=pad)
+            b0t = torch.from_numpy(b0[sl]).to(device)
+            dl = delta(at, yf, mem, pad_mask=pad, b0=b0t)
             dflat[sl] = dl.cpu().numpy()
-            sc = score_with_delta(torch.from_numpy(b0[sl]).to(device), dl)
+            if delta.last_gate is not None:
+                gflat[sl] = delta.last_gate.detach().cpu().numpy()
+            sc = topk_scores(b0t, dl, topk)
             picks[sl] = sc.argmax(1).cpu().numpy()
             finals[sl] = torch.from_numpy(sub[sl][..., 5])[
                 torch.arange(len(sc)), picks[sl]].numpy()
-    return finals, picks, sub, b0, logs, dflat
+    return finals, picks, sub, b0, logs, dflat, gflat
 
 
 def main():
@@ -229,6 +236,10 @@ def main():
                    help="lkeep covers candidates with final < f_b0 - keep_tol")
     p.add_argument("--fix_mode", choices=["b0", "all"], default="b0",
                    help="all: margin every candidate below best on wrong scenes")
+    p.add_argument("--topk_rerank", type=int, default=0,
+                   help="restrict Delta+argmax to top-K B0-logit candidates")
+    p.add_argument("--gate", action="store_true",
+                   help="scene-level sigmoid gate on Delta")
     p.add_argument("--lc_sg", action="store_true",
                    help="stop-gradient on shuffled-memory branch of L_c")
     p.add_argument("--grad_clip", type=float, default=0.0,
@@ -276,7 +287,8 @@ def main():
     memenc = MemTokenEnc(no_latent=args.no_latent).to(device)
     delta = MemoryDelta(no_latent=args.no_latent,
                         readout=args.readout,
-                        delta_cap=args.delta_cap).to(device)
+                        delta_cap=args.delta_cap,
+                        gate=args.gate).to(device)
     if args.key_ckpt:
         keynet.load_state_dict(torch.load(args.key_ckpt, map_location="cpu"))
         print(f"[mem] loaded key_ckpt {args.key_ckpt}", flush=True)
@@ -301,10 +313,12 @@ def main():
 
     def run_val(tag, ldict, t0):
         """val selection eval -> metrics, ckpt save. Returns val_final."""
-        vf, picks, sub, b0v, _, dflat = eval_selection(
-            bank, keynet, memenc, delta, val_ds, device)
-        vf_s, _, _, _, _, dflat_s = eval_selection(
-            bank, keynet, memenc, delta, val_ds, device, shuffle=True)
+        vf, picks, sub, b0v, _, dflat, gf = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device,
+            topk=args.topk_rerank)
+        vf_s, _, _, _, _, dflat_s, _ = eval_selection(
+            bank, keynet, memenc, delta, val_ds, device, shuffle=True,
+            topk=args.topk_rerank)
         sub_f = sub[..., 5]
         b0_pick = b0v.argmax(1)
         vf_b0 = sub_f[np.arange(len(sub)), b0_pick]
@@ -325,8 +339,9 @@ def main():
         flip = float((picks != b0_pick).mean())
         dgap = float(np.abs(dflat - dflat_s).mean())
         # train-subset eval (same bank): overfit vs shortcut diagnostic
-        tvf, tpicks, tsub, tb0v, _, _ = eval_selection(
-            bank, keynet, memenc, delta, tr_ds, device)
+        tvf, tpicks, tsub, tb0v, _, _, _ = eval_selection(
+            bank, keynet, memenc, delta, tr_ds, device,
+            topk=args.topk_rerank)
         tsub_f = tsub[..., 5]
         tb0_pick = tb0v.argmax(1)
         tvf_b0 = tsub_f[np.arange(len(tsub)), tb0_pick]
@@ -380,7 +395,8 @@ def main():
         ep_loss = ep_ret = ep_c = ep_main = ep_gn = 0.0
         nb = 0
         st = dict(lfix=0.0, lkeep=0.0, lkl=0.0, ldr=0.0, lret=0.0, lc=0.0,
-                  n_wrong=0, dstd=0.0, flip=0.0, cnt=0)
+                  n_wrong=0, dstd=0.0, flip=0.0, gw=0.0, gc=0.0,
+                  gnw=0, gnc=0, cnt=0)
         loader = DataLoader(train_ds, batch_size=args.batch_size,
                             shuffle=True, num_workers=args.num_workers,
                             collate_fn=collate_cache, drop_last=True)
@@ -421,8 +437,9 @@ def main():
 
                 at = b["a"].to(device)
                 yf = b["yhat"].to(device).flatten(2)
-                dl = delta(at, yf, mem, pad_mask=pad)
-                scores = score_with_delta(b["b0"].to(device), dl)
+                b0_t = b["b0"].to(device)
+                dl = delta(at, yf, mem, pad_mask=pad, b0=b0_t)
+                scores = topk_scores(b0_t, dl, args.topk_rerank)
                 final = b["sub"][..., 5].to(device)
 
                 # hard-scene weight: B0 top1 missed by >0.05
@@ -436,13 +453,13 @@ def main():
                 lce = lhinge = ks.new_zeros(())
                 # delta regulariser: penalise within-scene demeaned delta spread
                 ldr = (dl - dl.mean(1, keepdim=True)).pow(2).mean()
-                b0_t = b["b0"].to(device)
                 if args.loss == "top1":
                     lcore, parts = top1_loss(scores, b0_t, final,
                                              lam_kl=args.lam_kl,
                                              lam_keep=args.lam_keep,
                                              keep_tol=args.keep_tol,
-                                             fix_mode=args.fix_mode)
+                                             fix_mode=args.fix_mode,
+                                             topk=args.topk_rerank)
                     lmain = lcore + args.lam_dreg * ldr
                 else:
                     lce = listwise_ce(scores, final, weight=hw)
@@ -459,14 +476,15 @@ def main():
                     valid_s = torch.from_numpy(gs["valid"]).to(device)
                     pad_s = ~valid_s[:, :, None].expand(-1, -1, Kq)
                     pad_s = pad_s.reshape(B, -1) | drop   # same dropout draw
-                    dl_s = delta(at, yf, mem_s, pad_mask=pad_s)
-                    sc_s = score_with_delta(b0_t, dl_s)
+                    dl_s = delta(at, yf, mem_s, pad_mask=pad_s, b0=b0_t)
+                    sc_s = topk_scores(b0_t, dl_s, args.topk_rerank)
                     if args.loss == "top1":
                         l_s, _ = top1_loss(sc_s, b0_t, final,
                                            lam_kl=args.lam_kl,
                                            lam_keep=args.lam_keep,
                                            keep_tol=args.keep_tol,
-                                           fix_mode=args.fix_mode)
+                                           fix_mode=args.fix_mode,
+                                           topk=args.topk_rerank)
                         l_ref = lcore
                     else:
                         l_s = listwise_ce(sc_s, final, weight=hw)
@@ -487,17 +505,24 @@ def main():
                                    .std(1).mean())
                 st["flip"] += float((scores.argmax(1).cpu() != b0_pick)
                                     .float().mean())
+                if delta.last_gate is not None:
+                    gv = delta.last_gate.detach()
+                    wr = f_b0 < f_best - 0.05
+                    st["gw"] += float(gv[wr].sum()); st["gnw"] += int(wr.sum())
+                    st["gc"] += float(gv[~wr].sum()); st["gnc"] += int((~wr).sum())
                 st["cnt"] += 1
                 if nb and nb % 100 == 0:
                     c = st["cnt"]
+                    gw = st["gw"] / max(st["gnw"], 1)
+                    gc = st["gc"] / max(st["gnc"], 1)
                     print(f"[step] ep{ep} nb{nb} lfix={st['lfix']/c:.3f} "
                           f"lkeep={st['lkeep']/c:.3f} lkl={st['lkl']/c:.3f} "
                           f"ldr={st['ldr']/c:.3f} lret={st['lret']/c:.3f} "
                           f"lc={st['lc']/c:.3f} nw={st['n_wrong']/c:.0f} "
-                          f"dstd={st['dstd']/c:.3f} flip={st['flip']/c:.3f}",
+                          f"dstd={st['dstd']/c:.3f} flip={st['flip']/c:.3f} "
+                          f"gw={gw:.3f} gc={gc:.3f}",
                           flush=True)
-                    st = {k: (0 if k in ("n_wrong", "cnt") else 0.0)
-                          for k in st}
+                    st = {k: 0.0 for k in st}
             loss = lmain + args.lam_ret * lret
             opt.zero_grad()
             loss.backward()

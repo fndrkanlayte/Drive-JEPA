@@ -66,11 +66,13 @@ ck_args = ckpt.get("args", {})
 no_latent = bool(ck_args.get("no_latent", False))
 readout = ck_args.get("readout", "resid")
 delta_cap = float(ck_args.get("delta_cap", 1.0))
+gate = bool(ck_args.get("gate", False))
+topk = int(ck_args.get("topk_rerank", 0))
 keynet = KeyNet().to(device); keynet.load_state_dict(ckpt["keynet"])
 memenc = MemTokenEnc(no_latent=no_latent).to(device)
 memenc.load_state_dict(ckpt["memenc"])
 delta = MemoryDelta(no_latent=no_latent, readout=readout,
-                    delta_cap=delta_cap).to(device)
+                    delta_cap=delta_cap, gate=gate).to(device)
 delta.load_state_dict(ckpt["delta"])
 keynet.eval(); memenc.eval(); delta.eval()
 for m in (keynet, memenc, delta):
@@ -173,23 +175,28 @@ arms = [a for a in args.arms.split(",") if a != "b0"]
 dflat_lret = None
 for arm in arms:
     if arm == "lret":
-        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                            device, key_mode="lret")
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device, key_mode="lret",
+                                               topk=topk)
     elif arm == "appearance":
-        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                            device, key_mode="appearance")
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device,
+                                               key_mode="appearance",
+                                               topk=topk)
     elif arm == "random":
-        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                            device, key_mode="random")
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device,
+                                               key_mode="random",
+                                               topk=topk)
     elif arm == "shuffle":
-        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                            device, key_mode="lret",
-                                            shuffle=True)
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device, key_mode="lret",
+                                               shuffle=True, topk=topk)
     elif arm.startswith("scale"):
-        f, pk, _, _, _, dl = eval_selection(bank, keynet, memenc, delta, q_ds,
-                                            device, key_mode="lret",
-                                            scale=int(arm[5:]) / 100,
-                                            seed=args.seed)
+        f, pk, _, _, _, dl, _ = eval_selection(bank, keynet, memenc, delta,
+                                               q_ds, device, key_mode="lret",
+                                               scale=int(arm[5:]) / 100,
+                                               seed=args.seed, topk=topk)
     else:
         continue
     rep, masks = strat(f, pk)

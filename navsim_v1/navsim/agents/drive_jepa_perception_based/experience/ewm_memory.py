@@ -106,7 +106,7 @@ class MemoryDelta(nn.Module):
 
     def __init__(self, d: int = D_SCENE, n_heads: int = 4,
                  no_latent: bool = False, readout: str = "resid",
-                 delta_cap: float = 1.0):
+                 delta_cap: float = 1.0, gate: bool = False):
         super().__init__()
         self.no_latent = no_latent
         self.readout = readout
@@ -120,34 +120,51 @@ class MemoryDelta(nn.Module):
         self.out = nn.Linear(d, 1)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
+        # scene-level gate: g = sigmoid(w . [margin12, max_attn_sim,
+        # mean_valid] + b), b=-2 -> starts almost closed; Delta <- g*Delta
+        self.gate_lin = nn.Linear(3, 1) if gate else None
+        if self.gate_lin is not None:
+            nn.init.zeros_(self.gate_lin.weight)
+            nn.init.constant_(self.gate_lin.bias, -2.0)
+        self.last_gate = None
 
     def forward(self, a: torch.Tensor, yhat_flat: torch.Tensor,
                 mem: torch.Tensor,
-                pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                pad_mask: Optional[torch.Tensor] = None,
+                b0: Optional[torch.Tensor] = None) -> torch.Tensor:
         """a (B,K,256); yhat_flat (B,K,320); mem (B,M,256);
-        pad_mask (B,M) bool, True = ignore that memory token.
+        pad_mask (B,M) bool, True = ignore that memory token;
+        b0 (B,K) sigmoid scores, required when gate is enabled.
         Rows whose memory is fully masked get Delta = 0."""
         if self.no_latent:
             h = self.q_proj(a)
         else:
             h = self.q_proj(torch.cat([a, yhat_flat], dim=-1))
         fully = None
+        mean_valid = None
         if pad_mask is not None:
             pad_mask = pad_mask.clone()
+            mean_valid = (~pad_mask).float().mean(1)
             fully = pad_mask.all(1)
             pad_mask[fully, 0] = False        # keep one token to avoid NaN
+        w_last = None
         if self.readout == "mem":
             # Delta reads ONLY attention-retrieved memory content;
             # h enters the second pass only as the attention query
             ctx1, _ = self.attn[0](h, mem, mem,
                                    key_padding_mask=pad_mask)
             q2 = self.norm[0](h + ctx1)
-            ctx2, _ = self.attn[1](q2, mem, mem,
-                                   key_padding_mask=pad_mask)
+            ctx2, w_last = self.attn[1](
+                q2, mem, mem, key_padding_mask=pad_mask,
+                need_weights=(self.gate_lin is not None),
+                average_attn_weights=True)
             d = self.out(ctx2).squeeze(-1)
         else:
             for attn, norm in zip(self.attn, self.norm):
-                ctx, _ = attn(h, mem, mem, key_padding_mask=pad_mask)
+                ctx, w_last = attn(
+                    h, mem, mem, key_padding_mask=pad_mask,
+                    need_weights=(self.gate_lin is not None),
+                    average_attn_weights=True)
                 h = norm(h + ctx)
             d = self.out(h).squeeze(-1)
         if self.delta_cap > 0:
@@ -155,6 +172,19 @@ class MemoryDelta(nn.Module):
             d = c * torch.tanh(d / c)
         if fully is not None:
             d = d * (~fully).float().unsqueeze(-1)
+        if self.gate_lin is not None:
+            assert b0 is not None, "gate requires b0 scores"
+            lb = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
+            s2 = lb.topk(min(2, lb.shape[1]), dim=1).values
+            margin12 = s2[:, 0] - s2[:, 1]
+            max_sim = w_last.max(-1).values.mean(1) if w_last is not None \
+                else d.new_zeros(d.shape[0])
+            mv = mean_valid if mean_valid is not None \
+                else d.new_ones(d.shape[0])
+            feats = torch.stack([margin12, max_sim, mv], dim=1)
+            g = torch.sigmoid(self.gate_lin(feats)).squeeze(1)
+            self.last_gate = g
+            d = d * g.unsqueeze(-1)
         return d
 
 
@@ -198,11 +228,25 @@ def pairwise_hinge(scores: torch.Tensor, final: torch.Tensor,
     return loss / max(cnt, 1)
 
 
+def topk_scores(b0: torch.Tensor, dl: torch.Tensor,
+                K: int = 0) -> torch.Tensor:
+    """B0-logit + Delta scores restricted to top-K B0-logit candidates.
+    Outside top-K: Delta is forced to 0 and the score is -1e9, so the
+    candidate can never reach argmax. K<=0 or K>=Kq: no restriction."""
+    if not K or K >= b0.shape[1]:
+        return score_with_delta(b0, dl)
+    logit_b0 = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
+    tk = logit_b0.topk(K, dim=1).indices                     # (B,K)
+    mask = torch.zeros_like(b0, dtype=torch.bool).scatter(1, tk, True)
+    dl_m = torch.where(mask, dl, torch.zeros_like(dl))
+    return score_with_delta(b0, dl_m).masked_fill(~mask, -1e9)
+
+
 def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
               final: torch.Tensor, lam_kl: float = 1.0,
               lam_keep: float = 1.0, m: float = 0.5,
               T: float = 1.0, keep_tol: float = 0.005,
-              fix_mode: str = "b0") -> tuple:
+              fix_mode: str = "b0", topk: int = 0) -> tuple:
     """Top-1 anchored objective (Devin Bot spec).
 
     lkl   = KL(softmax(logit_b0/T) || softmax(scores/T))   trust region on all
@@ -214,7 +258,16 @@ def top1_loss(scores: torch.Tensor, b0: torch.Tensor,
     lkeep = mean_k relu(m - (score[b0pick] - score[k]))    B0-correct scenes,
             over k with final[k] < final[b0pick] - keep_tol
     returns (lmain, dict of parts) where
-    lmain = lfix + lam_keep*lkeep + lam_kl*lkl."""
+    lmain = lfix + lam_keep*lkeep + lam_kl*lkl.
+    When topk>0 everything below is computed only on the top-K candidates
+    by B0 logit: lkl sees K candidates, best = argmax final within K, and
+    'wrong' means B0 picked badly among the top-K."""
+    if topk and topk < b0.shape[1]:
+        _lb0 = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
+        _tk = _lb0.topk(topk, dim=1).indices
+        scores = scores.gather(1, _tk)
+        b0 = b0.gather(1, _tk)
+        final = final.gather(1, _tk)
     logit_b0 = torch.logit(b0.clamp(1e-6, 1 - 1e-6))
     lkl = F.kl_div(F.log_softmax(scores / T, dim=-1),
                    F.softmax(logit_b0 / T, dim=-1),

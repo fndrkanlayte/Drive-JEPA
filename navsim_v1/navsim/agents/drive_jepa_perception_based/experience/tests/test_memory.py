@@ -17,6 +17,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_memory import (
     retrieval_kl,
     score_with_delta,
     top1_loss,
+    topk_scores,
 )
 
 K, S_BANK, Q_LOG, B_LOG = 32, 40, "logQ", "logB"
@@ -225,6 +226,43 @@ def test_hinge_prefers_better_final():
     # raising a worse candidate's score must increase the loss
     l_down = pairwise_hinge(good + torch.tensor([[0., 0., 0.5]]), final)
     assert l_up < l_good < l_down
+
+
+def test_topk_rerank_zeroes_outside():
+    # candidates outside top-K by B0 logit get score -1e9 (never argmax)
+    # and contribute zero Delta
+    b0 = torch.tensor([[0.90, 0.80, 0.50, 0.20, 0.10, 0.05]])
+    dl = torch.ones(1, 6) * 0.5
+    sc = topk_scores(b0, dl, K=2)
+    assert float(sc[0, 0]) > -1e8 and float(sc[0, 1]) > -1e8
+    assert float(sc[0, 2]) == -1e9
+    assert int(sc.argmax(1)) in (0, 1)
+    # outside-K delta contributes nothing: same as masking the input
+    dl_m = torch.zeros_like(dl); dl_m[0, :2] = 0.5
+    ref = score_with_delta(b0, dl_m).masked_fill(
+        torch.tensor([[False, False, True, True, True, True]]), -1e9)
+    assert torch.allclose(sc, ref)
+
+
+def test_gate_shuts_delta():
+    # gate bias very negative -> g ~ 0 -> Delta ~ 0; positive -> passthrough
+    d = MemoryDelta(readout="mem", gate=True)
+    d2 = MemoryDelta(readout="mem", gate=False)
+    d2.load_state_dict(d.state_dict(), strict=False)
+    a = torch.randn(2, K, D_SCENE)
+    yh = torch.randn(2, K, N_SLOTS * D_LAT)
+    mem = torch.randn(2, 16, D_SCENE)
+    b0 = torch.rand(2, K).clamp(0.05, 0.95)
+    with torch.no_grad():
+        d.gate_lin.bias.fill_(-100.0)
+    d_off = d(a, yh, mem, b0=b0)
+    assert d_off.abs().max() < 1e-6
+    with torch.no_grad():
+        d.gate_lin.bias.fill_(100.0)
+        d.gate_lin.weight.zero_()
+    d_on = d(a, yh, mem, b0=b0)
+    d_ref = d2(a, yh, mem)
+    assert torch.allclose(d_on, d_ref, atol=1e-4)
 
 
 def test_top1_fix_mode_all_penalises_third_candidate():
