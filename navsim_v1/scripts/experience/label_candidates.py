@@ -155,6 +155,97 @@ def _pdm_reference_progress(metric_cache, cns) -> np.ndarray:
     return cns.scorer._progress_raw * cns.scorer._multi_metrics.prod(axis=0)
 
 
+
+def _vehicle_descriptor_row(
+    ego_polys,
+    observation,
+    unique_objects,
+    vehicle_tokens,
+    att_col_set,
+    att_ttc_set,
+    ego_heading,
+    dt,
+    num_steps,
+    top_m,
+    prefilter_dist,
+):
+    """One candidate's top-M vehicle descriptors.
+
+    Returns (desc_row (top_m, F), mask_row (top_m,), main_tok,
+             main_noatt (F,), main_tok_noatt, fault_vehicle_flag).
+    """
+    from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+
+    swept = unary_union(ego_polys)
+    minx, miny, maxx, maxy = swept.bounds
+    prefilter_box = (minx - prefilter_dist, miny - prefilter_dist,
+                     maxx + prefilter_dist, maxy + prefilter_dist)
+
+    fault_vehicle_flag = any(
+        unique_objects[t].tracked_object_type == TrackedObjectType.VEHICLE
+        for t in att_col_set
+        if t in unique_objects
+    )
+
+    descs: List[Dict[str, float]] = []
+    desc_tokens: List[str] = []
+    for tok in vehicle_tokens:
+        obj = unique_objects[tok]
+        # spatial prefilter on the t=0 polygon
+        occ0 = observation[0]
+        if tok not in occ0.token_to_idx:
+            continue
+        j0 = occ0[tok]
+        cx, cy = j0.centroid.x, j0.centroid.y
+        if not (prefilter_box[0] <= cx <= prefilter_box[2]
+                and prefilter_box[1] <= cy <= prefilter_box[3]):
+            continue
+
+        j_polys: List[Optional[object]] = []
+        for t in range(num_steps):
+            occ = observation[t]
+            j_polys.append(occ[tok] if tok in occ.token_to_idx else None)
+
+        velocity = getattr(obj, "velocity", None)
+        j_speed = (
+            float(np.hypot(velocity.x, velocity.y)) if velocity is not None else np.nan
+        )
+        d = compute_interaction_descriptor(
+            ego_polys,
+            j_polys,
+            ego_heading=ego_heading,
+            j_heading=float(obj.box.center.heading),
+            j_speed=j_speed,
+            dt=dt,
+            att_collision=tok in att_col_set,
+            att_ttc=tok in att_ttc_set,
+        )
+        descs.append(d)
+        desc_tokens.append(tok)
+
+    desc_row = np.full((top_m, NUM_DESCRIPTOR_FIELDS), np.nan, dtype=np.float32)
+    mask_row = np.zeros(top_m, dtype=bool)
+    main_tok = ""
+    order = select_top_m_vehicles(descs, top_m)
+    for rank, di in enumerate(order):
+        desc_row[rank] = [descs[di][f] for f in DESCRIPTOR_FIELDS]
+        mask_row[rank] = True
+        if rank == 0:
+            main_tok = desc_tokens[di]
+
+    # attribution-free top-1: the deployment-feasible "main vehicle"
+    main_noatt = np.full(NUM_DESCRIPTOR_FIELDS, np.nan, dtype=np.float32)
+    main_tok_noatt = ""
+    order_noatt = select_top_m_vehicles(descs, 1, use_attribution=False)
+    if order_noatt:
+        di = order_noatt[0]
+        main_noatt = np.array([descs[di][f] for f in DESCRIPTOR_FIELDS],
+                              dtype=np.float32)
+        main_tok_noatt = desc_tokens[di]
+
+    return desc_row, mask_row, main_tok, main_noatt, main_tok_noatt,         fault_vehicle_flag
+
+
 def label_scene(
     record_path: str,
     metric_cache_path: str,
@@ -263,68 +354,29 @@ def label_scene(
     multi_toks = np.array([[""] * top_m_vru for _ in range(num_cand)], dtype=object)
 
     for k in range(num_cand):
-        ego_polys = list(scorer._ego_polygons[k])  # (T+1,) shapely, global frame
-        swept = unary_union(ego_polys)
-        minx, miny, maxx, maxy = swept.bounds
-        prefilter_box = (minx - prefilter_dist, miny - prefilter_dist,
-                         maxx + prefilter_dist, maxy + prefilter_dist)
-
+        ego_polys = list(scorer._ego_polygons[k])  # (T+1,) shapely, global
         att_col_set = set(att_fault[k])
         att_ttc_set = set(att_ttc[k])
-        fault_vehicle_flag[k] = any(
-            unique_objects[t].tracked_object_type == TrackedObjectType.VEHICLE
-            for t in att_col_set
-            if t in unique_objects
+        (descriptors[k], vehicle_mask[k], main_vehicle_token[k],
+         main_desc_noatt[k], main_vehicle_token_noatt[k],
+         fault_vehicle_flag[k]) = _vehicle_descriptor_row(
+            ego_polys,
+            observation,
+            unique_objects,
+            vehicle_tokens,
+            att_col_set,
+            att_ttc_set,
+            ego_heading,
+            dt,
+            num_steps,
+            top_m,
+            prefilter_dist,
         )
-
-        descs: List[Dict[str, float]] = []
-        desc_tokens: List[str] = []
-        for tok in vehicle_tokens:
-            obj = unique_objects[tok]
-            # spatial prefilter on the t=0 polygon
-            occ0 = observation[0]
-            if tok not in occ0.token_to_idx:
-                continue
-            j0 = occ0[tok]
-            cx, cy = j0.centroid.x, j0.centroid.y
-            if not (prefilter_box[0] <= cx <= prefilter_box[2]
-                    and prefilter_box[1] <= cy <= prefilter_box[3]):
-                continue
-
-            j_polys: List[Optional[object]] = []
-            for t in range(num_steps):
-                occ = observation[t]
-                j_polys.append(occ[tok] if tok in occ.token_to_idx else None)
-
-            velocity = getattr(obj, "velocity", None)
-            j_speed = (
-                float(np.hypot(velocity.x, velocity.y)) if velocity is not None else np.nan
-            )
-            d = compute_interaction_descriptor(
-                ego_polys,
-                j_polys,
-                ego_heading=ego_heading,
-                j_heading=float(obj.box.center.heading),
-                j_speed=j_speed,
-                dt=dt,
-                att_collision=tok in att_col_set,
-                att_ttc=tok in att_ttc_set,
-            )
-            descs.append(d)
-            desc_tokens.append(tok)
-
-        order = select_top_m_vehicles(descs, top_m)
-        for rank, di in enumerate(order):
-            descriptors[k, rank] = [descs[di][f] for f in DESCRIPTOR_FIELDS]
-            vehicle_mask[k, rank] = True
-            if rank == 0:
-                main_vehicle_token[k] = desc_tokens[di]
-        # attribution-free top-1: the deployment-feasible "main vehicle"
-        order_noatt = select_top_m_vehicles(descs, 1, use_attribution=False)
-        if order_noatt:
-            di = order_noatt[0]
-            main_desc_noatt[k] = [descs[di][f] for f in DESCRIPTOR_FIELDS]
-            main_vehicle_token_noatt[k] = desc_tokens[di]
+        if include_vru:
+            swept = unary_union(ego_polys)
+            minx, miny, maxx, maxy = swept.bounds
+            prefilter_box = (minx - prefilter_dist, miny - prefilter_dist,
+                             maxx + prefilter_dist, maxy + prefilter_dist)
 
         # ---- multi-class descriptors (vehicle + pedestrian + bicycle) --------
         if include_vru:
