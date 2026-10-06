@@ -71,11 +71,15 @@ def agent_aux_loss(pred: torch.Tensor, vals: torch.Tensor, valid: torch.Tensor) 
 
 
 class _Trunk(nn.Module):
-    def __init__(self, n_layers: int, d_model: int = D_SCENE) -> None:
+    def __init__(self, n_layers: int, d_model: int = D_SCENE,
+                 dropout: float = 0.0, no_pfeat: bool = False,
+                 traj_jitter: float = 0.0) -> None:
         super().__init__()
         self.scene = SceneEncoder(d_model)
-        self.action = ActionEncoder(d_model)
-        self.layers = nn.ModuleList(PredictorLayer(d_model) for _ in range(n_layers))
+        self.action = ActionEncoder(d_model, no_pfeat=no_pfeat,
+                                    traj_jitter=traj_jitter)
+        self.layers = nn.ModuleList(PredictorLayer(d_model, dropout=dropout)
+                                    for _ in range(n_layers))
 
     def forward_trunk(self, image_feature, proposal_feature, trajectories):
         z = self.scene(image_feature)
@@ -88,8 +92,11 @@ class _Trunk(nn.Module):
 class B1Aux(_Trunk):
     """Direct regression + per-vehicle auxiliary regression (no latent)."""
 
-    def __init__(self, n_layers: int = 3, n_slots: int = 4, d_model: int = D_SCENE) -> None:
-        super().__init__(n_layers, d_model)
+    def __init__(self, n_layers: int = 3, n_slots: int = 4, d_model: int = D_SCENE,
+                 dropout: float = 0.0, no_pfeat: bool = False,
+                 traj_jitter: float = 0.0) -> None:
+        super().__init__(n_layers, d_model, dropout=dropout, no_pfeat=no_pfeat,
+                         traj_jitter=traj_jitter)
         self.n_slots = n_slots
         self.head = nn.Sequential(nn.Linear(d_model, 128), nn.GELU(), nn.Linear(128, N_SUB))
         self.aux = nn.Sequential(nn.Linear(d_model, 256), nn.GELU(),
@@ -139,8 +146,11 @@ class EWMStructured(_Trunk):
     """b3: vehicle-factorised outcome-latent world model."""
 
     def __init__(self, n_layers: int = 3, n_slots: int = 4, d_model: int = D_SCENE,
-                 d_latent: int = D_LATENT, use_future: bool = True) -> None:
-        super().__init__(n_layers, d_model)
+                 d_latent: int = D_LATENT, use_future: bool = True,
+                 dropout: float = 0.0, no_pfeat: bool = False,
+                 traj_jitter: float = 0.0) -> None:
+        super().__init__(n_layers, d_model, dropout=dropout, no_pfeat=no_pfeat,
+                         traj_jitter=traj_jitter)
         self.n_slots = n_slots
         self.d_latent = d_latent
         self.slot_emb = nn.Parameter(torch.randn(n_slots + 1, d_model) * 0.02)  # 0=ego
@@ -213,20 +223,77 @@ def relational_loss(y_hat: torch.Tensor, y_tgt: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(a @ a.transpose(1, 2), b @ b.transpose(1, 2))
 
 
+def relational_loss_ego(y_ego_hat: torch.Tensor, y_ego_tgt: torch.Tensor) -> torch.Tensor:
+    """Ego-slot-only relational geometry over all candidates. (B,K,L)."""
+    a = F.normalize(y_ego_hat, dim=-1)
+    b = F.normalize(y_ego_tgt, dim=-1)
+    return F.mse_loss(a @ a.transpose(1, 2), b @ b.transpose(1, 2))
+
+
+def xs_loss(y_ego: torch.Tensor, subs: torch.Tensor, log_ids: torch.Tensor,
+            n_sample: int = 512, tau: float = 0.1, t_s: float = 0.1) -> torch.Tensor:
+    """Cross-scene soft InfoNCE on the ego-slot outcome latent.
+
+    y_ego (B,K,L) candidate latents, subs (B,K,6) true subscores,
+    log_ids (B,K) integer log id per candidate. Prediction: softmax over
+    cos(y_a, y_b)/tau restricted to different-log b. Target: softmax over
+    exp(-||s_a - s_b||_1 / T_s) on the same restriction. Loss = KL(target||pred)
+    averaged over rows whose target support is non-empty.
+    """
+    B, K, L = y_ego.shape
+    y = F.normalize(y_ego.reshape(-1, L).float(), dim=-1)
+    s = subs.reshape(-1, subs.shape[-1]).float()
+    lg = log_ids.reshape(-1)
+    n = y.shape[0]
+    if n > n_sample:
+        idx = torch.randperm(n, device=y.device)[:n_sample]
+        y, s, lg = y[idx], s[idx], lg[idx]
+        n = n_sample
+    sim = y @ y.T / tau                                             # (n,n)
+    d = (s[:, None, :] - s[None, :, :]).abs().sum(-1)               # L1 on subscores
+    allowed = (lg[:, None] != lg[None, :]) & ~torch.eye(n, dtype=torch.bool, device=y.device)
+    w = torch.exp(-d / t_s) * allowed
+    has = w.sum(-1) > 0
+    if not bool(has.any()):
+        return y.new_zeros(())
+    sim = sim.masked_fill(~allowed, -1e9)
+    logp = F.log_softmax(sim, dim=-1)
+    tgt = w[has] / w[has].sum(-1, keepdim=True)
+    lp = logp[has]
+    kl = (tgt * (torch.log(tgt.clamp_min(1e-12)) - lp)).sum(-1)
+    return kl.mean()
+
+
 def b3_loss(model: EWMStructured, out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor],
-            lam_rel: float = 0.5, lam_fut: float = 0.5, lam_exist: float = 0.2):
+            lam_rel: float = 0.5, lam_fut: float = 0.5, lam_exist: float = 0.2,
+            bank_k: int = 0):
+    """b3 loss. With ``bank_k`` > 0, the last bank_k candidates are bank
+    trajectories: ego-slot outcome target + readout BCE apply to them, agent
+    slots / existence are masked out, and the relational loss is ego-slot-only
+    over all candidates."""
     vals, valid, slot = batch["agent_vals"], batch["agent_valid"], batch["agent_slot"]
     labels = batch["labels"]
     y_on = model.encode_outcome(vals, valid, slot, labels, ema=False)
     with torch.no_grad():
         y_t = model.encode_outcome(vals, valid, slot, labels, ema=True)
     w = torch.cat([torch.ones_like(slot[..., :1]), slot], dim=-1)            # (B,K,S)
+    if bank_k:
+        w[:, -bank_k:, 1:] = 0.0                                             # bank rows: ego only
     l2 = ((out["y_hat"] - y_t).pow(2).mean(-1) * w).sum() / w.sum().clamp_min(1.0)
     bce_hat = F.binary_cross_entropy_with_logits(out["readout"], labels)
-    bce_y = F.binary_cross_entropy_with_logits(model.read(y_on), labels)
+    k0 = out["y_hat"].shape[1] - bank_k
+    # bank rows have no agent-slot supervision: the through-encoder BCE (which
+    # reads all slots) is restricted to B0 rows.
+    bce_y = F.binary_cross_entropy_with_logits(
+        model.read(y_on[:, :k0]), labels[:, :k0])
     vic = vicreg_var_cov(y_on[w.bool()])
-    rel = relational_loss(out["y_hat"], y_t)
-    exist = F.binary_cross_entropy_with_logits(out["slot_logit"], slot)
+    if bank_k:
+        rel = relational_loss_ego(out["y_hat"][:, :, 0], y_t[:, :, 0])
+        exist = F.binary_cross_entropy_with_logits(
+            out["slot_logit"][:, :k0], slot[:, :k0])
+    else:
+        rel = relational_loss(out["y_hat"], y_t)
+        exist = F.binary_cross_entropy_with_logits(out["slot_logit"], slot)
     loss = l2 + bce_hat + 0.5 * bce_y + vic + lam_rel * rel + lam_exist * exist
     parts = {"l2": l2, "bce_hat": bce_hat, "bce_y": bce_y, "vic": vic, "rel": rel, "exist": exist}
     if model.use_future and "image_future" in batch:

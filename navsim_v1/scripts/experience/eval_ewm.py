@@ -49,13 +49,17 @@ TIMING_IDX = np.array([DESCRIPTOR_FIELD_INDEX[f] for f in TIMING_FIELDS])
 KNN_Q = 20
 
 
-def load_model(run_dir: Path, device):
-    ckpt = torch.load(Path(run_dir) / "model.pt", map_location="cpu",
+def load_model(run_dir: Path, device, ckpt_file: str = "model.pt"):
+    ckpt = torch.load(Path(run_dir) / ckpt_file, map_location="cpu",
                       weights_only=False)
     name = ckpt["args"]["model"]
     direct = name in ("b1", "b1aux")
-    model = build_model(name, ckpt["args"]["n_layers"],
-                        use_future=ckpt["args"].get("use_future", False)).to(device)
+    a = ckpt["args"]
+    model = build_model(name, a["n_layers"],
+                        use_future=a.get("use_future", False),
+                        dropout=a.get("dropout", 0.0),
+                        no_pfeat=a.get("no_pfeat", False),
+                        traj_jitter=a.get("traj_jitter", 0.0)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     # tag by run dir so several seeds of one arm do not overwrite each other

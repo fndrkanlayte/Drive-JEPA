@@ -56,19 +56,37 @@ class SceneEncoder(nn.Module):
 
 
 class ActionEncoder(nn.Module):
-    """Per-candidate action embedding from cached proposal_feature + raw traj."""
+    """Per-candidate action embedding from cached proposal_feature + raw traj.
 
-    def __init__(self, d_model: int = D_SCENE, d_traj_hidden: int = 128) -> None:
+    ``no_pfeat`` replaces the per-candidate proposal_feature with a learned
+    constant token so that arbitrary (non-B0-proposal) trajectories can be
+    embedded. ``traj_jitter`` adds N(0, sigma) noise to traj xy during training.
+    """
+
+    def __init__(self, d_model: int = D_SCENE, d_traj_hidden: int = 128,
+                 no_pfeat: bool = False, traj_jitter: float = 0.0) -> None:
         super().__init__()
+        self.no_pfeat = no_pfeat
+        self.traj_jitter = traj_jitter
         self.traj_mlp = nn.Sequential(
             nn.Linear(8 * 3, d_traj_hidden), nn.ReLU(), nn.Linear(d_traj_hidden, d_traj_hidden),
         )
+        if no_pfeat:
+            self.pfeat_const = nn.Parameter(torch.zeros(d_model))
         self.proj = nn.Linear(d_model + d_traj_hidden, d_model)
 
     def forward(self, proposal_feature: torch.Tensor, trajectories: torch.Tensor) -> torch.Tensor:
         # proposal_feature: (B, K, D); trajectories: (B, K, 8, 3)
-        t = self.traj_mlp(trajectories.flatten(-2))
-        return self.proj(torch.cat([proposal_feature, t], dim=-1))  # (B, K, D)
+        tr = trajectories
+        if self.training and self.traj_jitter > 0:
+            tr = tr.clone()
+            tr[..., :2] = tr[..., :2] + torch.randn_like(tr[..., :2]) * self.traj_jitter
+        t = self.traj_mlp(tr.flatten(-2))
+        if self.no_pfeat:
+            pf = self.pfeat_const.view(1, 1, -1).expand(t.shape[0], t.shape[1], -1)
+        else:
+            pf = proposal_feature
+        return self.proj(torch.cat([pf, t], dim=-1))  # (B, K, D)
 
 
 class PredictorLayer(nn.Module):
@@ -127,13 +145,16 @@ class EWMJEPA(nn.Module):
     """B2 EWM model (and B1 when ``direct=True``): shared encoders + trunk."""
 
     def __init__(self, n_layers: int = 3, d_model: int = D_SCENE,
-                 d_latent: int = D_LATENT, direct: bool = False) -> None:
+                 d_latent: int = D_LATENT, direct: bool = False,
+                 dropout: float = 0.0, no_pfeat: bool = False,
+                 traj_jitter: float = 0.0) -> None:
         super().__init__()
         self.direct = direct
         self.scene = SceneEncoder(d_model)
-        self.action = ActionEncoder(d_model)
+        self.action = ActionEncoder(d_model, no_pfeat=no_pfeat,
+                                    traj_jitter=traj_jitter)
         self.layers = nn.ModuleList(
-            PredictorLayer(d_model) for _ in range(n_layers)
+            PredictorLayer(d_model, dropout=dropout) for _ in range(n_layers)
         )
         if direct:
             self.head = nn.Sequential(

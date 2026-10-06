@@ -47,6 +47,7 @@ from navsim.agents.drive_jepa_perception_based.experience.ewm_structured import 
     agent_targets,
     b1aux_loss,
     b3_loss,
+    xs_loss,
 )
 from navsim.agents.drive_jepa_perception_based.experience.records import load_npz  # noqa: E402
 
@@ -72,11 +73,26 @@ def outcome_features(labels: dict) -> np.ndarray:
     return np.concatenate([timing, sub[:, :5], sub[:, 5:6]], axis=-1)
 
 
+def load_bank_npz(path: str) -> dict:
+    """bank_ours.npz -> {token: (trajs (N,8,3), subs (N,6))}."""
+    z = np.load(path, allow_pickle=True)
+    toks, counts = z["tokens"], z["counts"]
+    trajs, subs = z["trajs"], z["subs"]
+    bank, off = {}, 0
+    for t, c in zip(toks, counts):
+        bank[str(t)] = (trajs[off:off + c], subs[off:off + c])
+        off += c
+    return bank
+
+
 class LatentDataset(Dataset):
     def __init__(self, tokens, lat_index: dict, labels_dir: Path,
-                 structured: bool = False, future_map: dict = None):
+                 structured: bool = False, future_map: dict = None,
+                 bank: dict = None, bank_per_scene: int = 0):
         self.structured = structured
         self.future_map = future_map
+        self.bank = bank
+        self.bank_per_scene = bank_per_scene
         self.lat_index = lat_index
         self.items = []
         labels_dir = Path(labels_dir)
@@ -94,6 +110,28 @@ class LatentDataset(Dataset):
         lat = load_npz(lat_path)
         lab = load_npz(lab_path)
         extra = {}
+        if self.bank is not None and self.bank_per_scene > 0:
+            bt, bs = self.bank.get(token, (None, None))
+            bk_traj = np.zeros((self.bank_per_scene, 8, 3), np.float32)
+            bk_sub = np.zeros((self.bank_per_scene, 6), np.float32)
+            if bt is not None and len(bt) > 0:
+                n = len(bt)
+                unsafe = np.where((bs[:, 0] < 0.5) | (bs[:, 1] < 0.5))[0]
+                n_half = self.bank_per_scene // 2
+                pick_u = np.random.choice(unsafe, min(n_half, len(unsafe)),
+                                          replace=False) if len(unsafe) else np.array([], int)
+                rest = np.setdiff1d(np.arange(n), pick_u)
+                need = self.bank_per_scene - len(pick_u)
+                pick_r = np.random.choice(rest, min(need, len(rest)),
+                                          replace=False) if len(rest) else np.array([], int)
+                pick = np.concatenate([pick_u, pick_r])
+                if len(pick) < self.bank_per_scene:        # bank smaller than BK
+                    pad = np.random.choice(pick, self.bank_per_scene - len(pick),
+                                           replace=True)
+                    pick = np.concatenate([pick, pad])
+                bk_traj = np.asarray(bt[pick], np.float32)
+                bk_sub = np.asarray(bs[pick], np.float32)
+            extra.update(bank_trajs=bk_traj, bank_labels=bk_sub)
         if self.structured:
             vals, valid, slot = agent_targets(lab["descriptors"], lab["vehicle_mask"])
             extra.update(agent_vals=vals, agent_valid=valid, agent_slot=slot)
@@ -134,7 +172,7 @@ def build_index(latents_dir: Path) -> dict:
 
 
 OPTIONAL_KEYS = ["agent_vals", "agent_valid", "agent_slot", "expert_traj", "has_traj",
-                 "image_future", "has_future"]
+                 "image_future", "has_future", "bank_trajs", "bank_labels"]
 
 
 def collate(batch):
@@ -213,14 +251,61 @@ def evaluate(model, loader, device, direct: bool) -> dict:
     )
 
 
-def build_model(name: str, n_layers: int, use_future: bool = False):
+def build_model(name: str, n_layers: int, use_future: bool = False,
+                dropout: float = 0.0, no_pfeat: bool = False,
+                traj_jitter: float = 0.0):
     if name in ("b1", "b2"):
-        return EWMJEPA(n_layers=n_layers, direct=(name == "b1"))
+        return EWMJEPA(n_layers=n_layers, direct=(name == "b1"), dropout=dropout,
+                       no_pfeat=no_pfeat, traj_jitter=traj_jitter)
     if name == "b1aux":
-        return B1Aux(n_layers=n_layers)
+        return B1Aux(n_layers=n_layers, dropout=dropout, no_pfeat=no_pfeat,
+                     traj_jitter=traj_jitter)
     if name == "b3":
-        return EWMStructured(n_layers=n_layers, use_future=use_future)
+        return EWMStructured(n_layers=n_layers, use_future=use_future,
+                             dropout=dropout, no_pfeat=no_pfeat,
+                             traj_jitter=traj_jitter)
     raise ValueError(name)
+
+
+@torch.no_grad()
+def collect_yego(model, loader, device):
+    """-> ego-slot y_hat (N,L), true finals (N,), per-candidate log names (N,)."""
+    ye, fin, lg = [], [], []
+    for b in loader:
+        out = model(b["image_feature"].to(device),
+                    b["proposal_feature"].to(device),
+                    b["proposals"].to(device))
+        ye.append(out["y_hat"][:, :, 0].float().cpu().numpy())
+        fin.append(b["labels"][..., 5].numpy())
+        for i, ln in enumerate(b["log_names"]):
+            lg.extend([ln] * b["labels"].shape[1])
+    return (np.concatenate(ye).reshape(-1, ye[0].shape[-1]),
+            np.concatenate(fin).reshape(-1), np.asarray(lg))
+
+
+def knn_val_mae(q_y, q_fin, q_logs, b_y, b_fin, b_logs, k: int = 16,
+                t: float = 0.1, device="cpu") -> float:
+    """Cross-log top-k cosine kNN of ego-slot y_hat -> weighted final MAE.
+
+    weights = softmax(cos / t) over the k neighbours (t=0.1).
+    """
+    qn = q_y / (np.linalg.norm(q_y, axis=1, keepdims=True) + 1e-8)
+    bn = b_y / (np.linalg.norm(b_y, axis=1, keepdims=True) + 1e-8)
+    bt = torch.from_numpy(bn).to(device)
+    bf = torch.from_numpy(b_fin).float().to(device)
+    maes = []
+    CH = 8192
+    for s in range(0, len(qn), CH):
+        qc = torch.from_numpy(qn[s:s + CH]).to(device)
+        sim = qc @ bt.T                                     # (c, NB)
+        for i, ln in enumerate(q_logs[s:s + CH]):
+            same = torch.from_numpy(b_logs == ln).to(device)
+            sim[i] = sim[i].masked_fill(same, -1e9)
+        tk = sim.topk(k, dim=-1)                            # (c, k)
+        w = torch.softmax(tk.values / t, dim=-1)
+        fhat = (w * bf[tk.indices]).sum(-1).cpu().numpy()
+        maes.append(np.abs(fhat - q_fin[s:s + CH]))
+    return float(np.concatenate(maes).mean())
 
 
 def main() -> None:
@@ -244,8 +329,24 @@ def main() -> None:
     p.add_argument("--lam_rel", type=float, default=0.5)
     p.add_argument("--lam_fut", type=float, default=0.5)
     p.add_argument("--lam_aux", type=float, default=0.5)
+    p.add_argument("--no_pfeat", action="store_true",
+                   help="ActionEncoder drops proposal_feature (learned const) "
+                        "so arbitrary trajectories can be embedded")
+    p.add_argument("--bank_npz", default=None,
+                   help="bank_ours.npz (T0): extra per-scene candidate trajs; "
+                        "requires --no_pfeat, train split only")
+    p.add_argument("--bank_per_scene", type=int, default=16)
+    p.add_argument("--lam_xs", type=float, default=0.0,
+                   help="cross-scene soft InfoNCE on ego-slot y_hat")
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--traj_jitter", type=float, default=0.0,
+                   help="sigma (m) of train-time xy jitter on candidate trajs")
+    p.add_argument("--select_metric", choices=["none", "knn_val"], default="none",
+                   help="knn_val: save model_best.pt by cross-log kNN finalMAE")
     p.add_argument("--out_dir", required=True)
     args = p.parse_args()
+    if args.bank_npz and not args.no_pfeat:
+        raise SystemExit("--bank_npz requires --no_pfeat")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -264,8 +365,13 @@ def main() -> None:
     fmap = None
     if args.model == "b3" and args.future_map:
         fmap = json.load(open(args.future_map))["map"]
-    train_ds = LatentDataset(train_tokens, lat_index, labels_dir, structured, fmap)
+    bank = load_bank_npz(args.bank_npz) if args.bank_npz else None
+    train_ds = LatentDataset(train_tokens, lat_index, labels_dir, structured, fmap,
+                             bank=bank, bank_per_scene=args.bank_per_scene)
     val_ds = LatentDataset(val_tokens, lat_index, labels_dir, structured, None)
+    if bank is not None:
+        n_hit = sum(1 for t, _, _ in train_ds.items if t in bank)
+        print(f"[train] bank coverage: {n_hit}/{len(train_ds)} train scenes", flush=True)
     if fmap is not None:
         n_fut = sum(1 for t, _, _ in train_ds.items
                     if fmap.get(t, {}).get("future_token") in lat_index)
@@ -281,12 +387,15 @@ def main() -> None:
                             pin_memory=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(args.model, args.n_layers, use_future=fmap is not None).to(device)
+    model = build_model(args.model, args.n_layers, use_future=fmap is not None,
+                        dropout=args.dropout, no_pfeat=args.no_pfeat,
+                        traj_jitter=args.traj_jitter).to(device)
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                             lr=args.lr, weight_decay=args.wd)
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     history = []
+    best_sel = float("inf")
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -299,6 +408,22 @@ def main() -> None:
             o = b["outcomes"].to(device, non_blocking=True)     # (B,K,18)
             labels = b["labels"].to(device, non_blocking=True).clamp(0, 1)
             bd = {k: b[k].to(device, non_blocking=True) for k in OPTIONAL_KEYS if k in b}
+            K0 = tr.shape[1]
+            bank_k = 0
+            if "bank_trajs" in bd:
+                bk_t = bd.pop("bank_trajs")
+                bk_l = bd.pop("bank_labels").clamp(0, 1)
+                tr = torch.cat([tr, bk_t], dim=1)
+                labels = torch.cat([labels, bk_l], dim=1)
+                bank_k = bk_t.shape[1]
+                B, M = bd["agent_slot"].shape[0], bd["agent_slot"].shape[2]
+                f_agent = bd["agent_vals"].shape[-1]
+                bd["agent_vals"] = torch.cat(
+                    [bd["agent_vals"], torch.zeros(B, bank_k, M, f_agent, device=device)], 1)
+                bd["agent_valid"] = torch.cat(
+                    [bd["agent_valid"], torch.zeros(B, bank_k, M, f_agent, device=device)], 1)
+                bd["agent_slot"] = torch.cat(
+                    [bd["agent_slot"], torch.zeros(B, bank_k, M, device=device)], 1)
             bd["labels"] = labels
 
             opt.zero_grad(set_to_none=True)
@@ -308,7 +433,16 @@ def main() -> None:
                     loss, parts = b1aux_loss(out, bd, lam_aux=args.lam_aux)
                 elif args.model == "b3":
                     loss, parts = b3_loss(model, out, bd, lam_rel=args.lam_rel,
-                                          lam_fut=args.lam_fut)
+                                          lam_fut=args.lam_fut, bank_k=bank_k)
+                    if args.lam_xs > 0:
+                        inv = np.unique(np.asarray(b["log_names"]),
+                                        return_inverse=True)[1]
+                        lid = torch.as_tensor(
+                            np.repeat(inv[:, None], out["y_hat"].shape[1], axis=1),
+                            device=device)
+                        xs = xs_loss(out["y_hat"][:, :, 0], labels, lid)
+                        loss = loss + args.lam_xs * xs
+                        parts["xs"] = float(xs.detach())
                 elif args.model == "b1":
                     loss = F.binary_cross_entropy_with_logits(out["logits"], labels)
                     parts = {"bce": loss.item()}
@@ -334,6 +468,17 @@ def main() -> None:
         metrics = evaluate(model, val_loader, device, direct=(args.model in ("b1", "b1aux")))
         row = {"epoch": epoch, "secs": round(time.time() - t0, 1),
                **{k: round(v / nb, 4) for k, v in losses.items()}, **metrics}
+        if args.select_metric == "knn_val" and args.model == "b3":
+            ty, tf, tl = collect_yego(model, train_loader, device)
+            vy, vf, vl = collect_yego(model, val_loader, device)
+            mae = knn_val_mae(vy, vf, vl, ty, tf, tl, device=device)
+            row["knn_val"] = round(mae, 5)
+            if mae < best_sel:
+                best_sel = mae
+                torch.save({"model": model.state_dict(), "epoch": epoch,
+                            "knn_val": mae,
+                            "args": {**vars(args), "use_future": fmap is not None}},
+                           out_dir / "model_best.pt")
         history.append(row)
         print(f"[train] {row}", flush=True)
 
