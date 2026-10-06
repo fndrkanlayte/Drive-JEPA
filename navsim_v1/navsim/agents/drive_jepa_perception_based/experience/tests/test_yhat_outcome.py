@@ -273,3 +273,44 @@ def test_dump_tokens_align_with_loader_rows(tmp_path):
         np.testing.assert_allclose(
             lab["subscores"][:, 5], ds[i]["labels"][:, 5],
             err_msg=f"row {i} token {t} misaligned")
+
+
+def test_readout_select_rules():
+    """Rule a picks argmax s_hat inside pdm top-K; rule b with beta=0 picks
+    B0's top1; composed score follows the PDM weighting."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]
+                           / "scripts" / "experience"))
+    import numpy as np
+    from readout_select import pick_scene, s_hat_scores, danger_auc, topk_idx
+
+    rng = np.random.default_rng(1)
+    S, K = 8, 32
+    pdm = np.sort(rng.random((S, K)), axis=1)
+    shat = rng.random((S, K))
+    for s in range(S):
+        tk = topk_idx(pdm[s], 4)
+        want = tk[np.argmax(shat[s, tk])]
+        assert pick_scene(pdm[s], shat[s], 4, "a") == want
+        # beta=0 z-fusion degenerates to pdm argmax inside top-K
+        assert pick_scene(pdm[s], shat[s], 4, "b", 0.0) == tk[0]
+
+    rd = np.zeros((1, 4, 6), np.float32)
+    rd[0, :, 0] = rd[0, :, 1] = 1.0          # NC=DAC=1
+    rd[0, :, 2] = rd[0, :, 3] = rd[0, :, 4] = 1.0   # EP=TTC=C=1
+    comp = s_hat_scores(rd, "composed")
+    np.testing.assert_allclose(comp[0], np.ones(4), atol=1e-6)
+
+    # danger_auc: make readout unsafe exactly on the dangerous candidates
+    z = {"pdm": np.array([[.9, .8, .7, .6]]),
+         "subs": np.array([[[1, 1, 1, 1, 1, 1],
+                           [0, 1, 1, 1, 1, 1],
+                           [1, 1, 1, 1, 1, 1],
+                           [1, 1, 1, 1, 1, 1]]]),
+         "readout": np.array([[[1., 1., 1., 1., 1., 1.],
+                              [0., 1., 1., 1., 1., 1.],
+                              [1., 1., 1., 1., 1., 1.],
+                              [1., 1., 1., 1., 1., 1.]]])}
+    d = danger_auc(z, k=4)
+    assert d["n_danger"] == 1 and abs(d["auc"] - 1.0) < 1e-9
