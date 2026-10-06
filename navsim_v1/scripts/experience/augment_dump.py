@@ -26,10 +26,8 @@ def topk_idx(row, k):
 
 def build_index(d):
     idx = {}
-    for log_dir in sorted(Path(d).iterdir()):
-        if log_dir.is_dir():
-            for f in log_dir.glob("*.npz"):
-                idx[f.stem] = f
+    for f in Path(d).rglob("*.npz"):
+        idx[f.stem] = f
     return idx
 
 

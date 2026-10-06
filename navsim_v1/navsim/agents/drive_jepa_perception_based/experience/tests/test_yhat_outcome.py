@@ -235,3 +235,41 @@ def test_bank_filter_tokens_excludes_uncovered():
     out = bank_filter_tokens(toks, bank)
     # t3 is in bank but maps to None -> also excluded; t0/t2 absent -> excluded
     assert out == ["t1"]
+
+
+def test_dump_tokens_align_with_loader_rows(tmp_path):
+    """Regression: LatentDataset sorts items by token internally, so dump
+    tokens must come from ds.items (not the file's original order), else
+    every token-keyed lookup (subscores, pred_logit) is misaligned."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "scripts" / "experience"))
+    from train_ewm import LatentDataset, build_index
+    from eval_yhat import dump_tokens
+
+    rng = np.random.default_rng(0)
+    K = 4
+    lat_dir = tmp_path / "lat" / "logA"
+    lab_dir = tmp_path / "lab"
+    lat_dir.mkdir(parents=True)
+    lab_dir.mkdir(parents=True)
+    toks = ["tok_c", "tok_a", "tok_b"]          # deliberately unsorted
+    for t in toks:
+        np.savez(lat_dir / f"{t}.npz", token=t, log_name="logA",
+                 image_feature=rng.normal(size=(512, D)).astype(np.float32),
+                 proposal_feature=rng.normal(size=(K, D)).astype(np.float32),
+                 proposals=rng.normal(size=(K, 8, 3)).astype(np.float32),
+                 pdm_score=rng.random(K).astype(np.float32))
+        subs = rng.random((K, 6)).astype(np.float32)
+        np.savez(lab_dir / f"{t}.npz", token=t, log_name="logA",
+                 subscores=subs,
+                 descriptors=rng.normal(size=(K, 4, 21)).astype(np.float32),
+                 vehicle_mask=np.ones((K, 4), bool),
+                 main_desc_noatt=rng.normal(size=(K, 24)).astype(np.float32))
+
+    ds = LatentDataset(list(toks), build_index(lat_dir.parent), lab_dir)
+    toks_out = dump_tokens(ds)
+    assert toks_out == sorted(toks)             # loader order, not file order
+    for i, t in enumerate(toks_out):
+        lab = np.load(lab_dir / f"{t}.npz")
+        np.testing.assert_allclose(
+            lab["subscores"][:, 5], ds[i]["labels"][:, 5],
+            err_msg=f"row {i} token {t} misaligned")

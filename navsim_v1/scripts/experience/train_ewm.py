@@ -166,7 +166,7 @@ class LatentDataset(Dataset):
             proposals=np.asarray(lat["proposals"], dtype=np.float32),
             pdm_score=np.asarray(lat["pdm_score"], dtype=np.float32),
             pred_logit=np.asarray(lat["pred_logit"], dtype=np.float32)
-            if "pred_logit" in lat.files else np.zeros((32, 6), np.float32),
+            if "pred_logit" in lat else np.zeros((32, 6), np.float32),
             outcomes=outcome_features(lab),
             labels=np.asarray(lab["subscores"], dtype=np.float32),
         )

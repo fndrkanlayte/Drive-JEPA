@@ -174,10 +174,22 @@ def topk_indices(pdm_row, k):
     return np.argpartition(-pdm_row, k - 1)[:k]
 
 
-def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu"):
+def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu",
+                whiten="meanstd"):
     """Per-query cross-log top-k cosine kNN -> dict of weighted subscore
     readouts: fhat (w·final), p_nc/p_dac/p_ttc (w·frac(sub<1)), f_ep (w·EP),
-    cos (mean top-k similarity, masked neighbours clamped to 0)."""
+    cos (mean top-k similarity, masked neighbours clamped to 0).
+
+    whiten="meanstd": centre+scale query and bank ŷ by the bank's per-dim
+    mean/std before the cosine (removes the dominant common direction).
+    whiten="off": raw ŷ (previous behaviour)."""
+    if whiten == "meanstd":
+        mu = b_y.mean(0)
+        sd = b_y.std(0) + 1e-6
+        q_y = (q_y - mu) / sd
+        b_y = (b_y - mu) / sd
+    elif whiten != "off":
+        raise ValueError(f"unknown whiten mode {whiten!r}")
     qn = q_y / (np.linalg.norm(q_y, axis=1, keepdims=True) + 1e-8)
     bn = b_y / (np.linalg.norm(b_y, axis=1, keepdims=True) + 1e-8)
     bt = torch.from_numpy(bn).to(device)
@@ -208,14 +220,22 @@ def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu"):
     return out
 
 
-def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu"):
+def dump_tokens(ds):
+    """Tokens in the same order as DataLoader output (ds.items is sorted
+    internally) so every dump row stays aligned with its token."""
+    return [it[0] for it in ds.items]
+
+
+def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu",
+             whiten="meanstd"):
     b_subs = np.zeros((len(b_fin), 6), np.float32)
     b_subs[:, 5] = b_fin
-    return knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k, t, device)["fhat"]
+    return knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k, t, device,
+                       whiten=whiten)["fhat"]
 
 
 def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
-                device, dumps=None):
+                device, dumps=None, whiten="meanstd"):
     """bank_variants: {name: (b_y, b_fin, b_logs, b_scene)}"""
     res = {}
     S, K = labels.shape[:2]
@@ -240,7 +260,8 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
         b0_wrong[Ksel] = m
 
     for bname, (b_y, b_fin, b_logs, b_scene, b_subs) in bank_variants.items():
-        rd = knn_readout(q_y, q_cand_logs, b_y, b_subs, b_logs, device=device)
+        rd = knn_readout(q_y, q_cand_logs, b_y, b_subs, b_logs, device=device,
+                         whiten=whiten)
         fhat_flat = rd["fhat"]
         fhat = fhat_flat.reshape(S, K)
         # shuffle control: permute whole subscore rows within each bank SCENE
@@ -250,7 +271,7 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
             m = b_scene == sc
             b_subs_sh[m] = b_subs_sh[m][rng.permutation(int(m.sum()))]
         rd_sh = knn_readout(q_y, q_cand_logs, b_y, b_subs_sh, b_logs,
-                            device=device)
+                            device=device, whiten=whiten)
         fhat_sh = rd_sh["fhat"].reshape(S, K)
         if dumps is not None:
             d = {"fhat": fhat.astype(np.float32),
@@ -297,6 +318,12 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
         res[f"M2_pairwise_auc/{bname}"] = m2
         res[f"M3_partial_spearman/{bname}"] = m3
         res[f"M2_shuffle_control_K8/{bname}"] = float(np.mean(auc_c))
+        cv = rd["cos"]
+        res[f"knn_cos_stats/{bname}"] = {
+            "mean": float(cv.mean()), "std": float(cv.std()),
+            "p05": float(np.quantile(cv, .05)),
+            "p50": float(np.quantile(cv, .50)),
+            "p95": float(np.quantile(cv, .95))}
         print(f"[{tag}/{bname}] finalMAE={mae:.4f} "
               f"auc_f(all,K8)={m2['K8/all']['auc_fhat']:.3f} "
               f"auc_b0={m2['K8/all']['auc_b0']:.3f} "
@@ -315,6 +342,9 @@ def main():
     p.add_argument("--runs", required=True, help="comma-separated run dirs")
     p.add_argument("--ckpt", default="model.pt")
     p.add_argument("--bank_npz", default=None)
+    p.add_argument("--whiten", default="meanstd",
+                   choices=("meanstd", "off"),
+                   help="ŷ centre+scale by train-memory stats before cosine")
     p.add_argument("--dump_npz", default=None,
                    help="per-query dump: tokens/pdm/final/fhat(+shuf)/rare10 "
                         "per run & bank variant, for rerank_yhat.py")
@@ -376,7 +406,8 @@ def main():
 
         dumps = {} if args.dump_npz else None
         report[tag] = run_metrics(tag, y_ego, labels, pdm.copy(), q_logs, variants,
-                                  tert, rare10, device, dumps=dumps)
+                                  tert, rare10, device, dumps=dumps,
+                                  whiten=args.whiten)
         if dumps is not None:
             dump_runs[tag] = dumps
 
@@ -394,7 +425,7 @@ def main():
                     for s in range(len(pdm_t))])
             np.savez(
                 pth,
-                tokens=np.asarray(tokens),
+                tokens=np.asarray(dump_tokens(ds)),
                 rare10=rare10.astype(bool),
                 pdm=pdm_t,
                 final=final_t,

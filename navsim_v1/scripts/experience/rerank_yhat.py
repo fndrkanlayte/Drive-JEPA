@@ -36,17 +36,15 @@ import numpy as np
 
 KS = (2, 4, 8)
 MS = (0.0, 0.02, 0.05, 0.1)
-EPS = (0.0, 0.05)
+EPS = (0.0,)
 QS = (0.0, 0.25, 0.5)
-B0G = (0, 1)
 
 
 def topk_idx(pdm_row, k):
     return np.argpartition(-pdm_row, k - 1)[:k]
 
 
-def pick_one(pdm_s, fhat_s, pnc_s, pdac_s, cos_s, b0_s, k, m, eps, qthr,
-             use_b0):
+def pick_one(pdm_s, fhat_s, pnc_s, pdac_s, pttc_s, cos_s, k, m, eps, qthr):
     """Return picked candidate index for one scene."""
     t1 = int(pdm_s.argmax())
     best, best_f = t1, -np.inf
@@ -57,27 +55,23 @@ def pick_one(pdm_s, fhat_s, pnc_s, pdac_s, cos_s, b0_s, k, m, eps, qthr,
         if not (fhat_s[j] - fhat_s[t1] > m):
             continue
         if not (pnc_s[j] <= pnc_s[t1] + eps
-                and pdac_s[j] <= pdac_s[t1] + eps):
+                and pdac_s[j] <= pdac_s[t1] + eps
+                and pttc_s[j] <= pttc_s[t1] + eps):
             continue
         if cos_s[j] < qthr:
-            continue
-        if use_b0 and b0_s is not None and not (
-                b0_s[j, 0] >= b0_s[t1, 0] - eps
-                and b0_s[j, 1] >= b0_s[t1, 1] - eps):
             continue
         if fhat_s[j] > best_f:
             best, best_f = j, fhat_s[j]
     return best
 
 
-def flip_eval(pdm, final, fhat, pnc, pdac, cos, b0, splits, k, m, eps,
-              qthr, use_b0, diagnose=None):
+def flip_eval(pdm, final, fhat, pnc, pdac, pttc, cos, splits, k, m, eps,
+              qthr, diagnose=None, cfg_key=None):
     S = len(pdm)
     pick = np.empty(S, np.int64)
     for s in range(S):
-        pick[s] = pick_one(pdm[s], fhat[s], pnc[s], pdac[s], cos[s],
-                           b0[s] if b0 is not None else None,
-                           k, m, eps, qthr, use_b0)
+        pick[s] = pick_one(pdm[s], fhat[s], pnc[s], pdac[s], pttc[s], cos[s],
+                           k, m, eps, qthr)
     out = {}
     t1 = pdm.argmax(1)
     delta = final[np.arange(S), pick] - final[np.arange(S), t1]
@@ -106,7 +100,7 @@ def flip_eval(pdm, final, fhat, pnc, pdac, cos, b0, splits, k, m, eps,
                 "true_subs": None, "delta": float(delta[s]),
                 "fhat": float(fhat[s, j]), "p_nc": float(pnc[s, j]),
                 "p_dac": float(pdac[s, j]), "cos": float(cos[s, j])})
-        diagnose.append((k, m, eps, qthr, use_b0, rows))
+        diagnose.append((cfg_key, rows))
     return out
 
 
@@ -117,11 +111,13 @@ def grid(npz, variant, diagnose_rows=None, selected_only=None):
     fhat = npz[pre + "fhat"]
     pnc = npz[pre + "p_nc"]
     pdac = npz[pre + "p_dac"]
+    pttc = npz[pre + "p_ttc"]
     cos = npz[pre + "cos"]
-    b0 = npz["b0_sub"] if "b0_sub" in npz.files else None
-    fs, pnc_s, pdac_s = (npz[pre + "fhat_shuf"], npz[pre + "p_nc_shuf"],
-                         npz[pre + "p_dac_shuf"])
-    res = {}
+    fs, pnc_s, pdac_s, pttc_s = (npz[pre + "fhat_shuf"], npz[pre + "p_nc_shuf"],
+                               npz[pre + "p_dac_shuf"], npz[pre + "p_ttc_shuf"])
+    res = {"_cos_stats": {"median": float(np.median(cos)),
+                          "p10": float(np.quantile(cos, .10)),
+                          "p90": float(np.quantile(cos, .90))}}
     for k in KS:
         if f"b0_wrong_K{k}" in npz.files:
             b0w = npz[f"b0_wrong_K{k}"].astype(bool)
@@ -135,19 +131,15 @@ def grid(npz, variant, diagnose_rows=None, selected_only=None):
         for m in MS:
             for eps in EPS:
                 for q in QS:
-                    for bg in B0G:
-                        if bg and b0 is None:
-                            continue
-                        qt = float(np.quantile(cos, q)) if q > 0 \
-                            else -np.inf
-                        key = f"K{k}/m{m}/e{eps}/q{q}/b0g{bg}"
-                        res[key] = flip_eval(
-                            pdm, final, fhat, pnc, pdac, cos, b0, splits,
-                            k, m, eps, qt, bg,
-                            diagnose=diagnose_rows)
-        res[f"K{k}/shuf"] = flip_eval(pdm, final, fs, pnc_s, pdac_s, cos,
-                                      b0, splits, k, 0.02, 0.0, -np.inf,
-                                      b0 is not None)
+                    qt = float(np.quantile(cos, q)) if q > 0 \
+                        else -np.inf
+                    key = f"K{k}/m{m}/e{eps}/q{q}"
+                    res[key] = flip_eval(
+                        pdm, final, fhat, pnc, pdac, pttc, cos, splits,
+                        k, m, eps, qt,
+                        diagnose=diagnose_rows, cfg_key=key)
+        res[f"K{k}/shuf"] = flip_eval(pdm, final, fs, pnc_s, pdac_s, pttc_s,
+                                      cos, splits, k, 0.02, 0.0, -np.inf)
     return res
 
 
@@ -165,7 +157,8 @@ def main():
     vres = grid(val, args.variant)
     report = {"variant": args.variant, "val": vres}
 
-    cand = {k: v for k, v in vres.items() if "/shuf" not in k}
+    cand = {k: v for k, v in vres.items()
+            if "/shuf" not in k and not k.startswith("_")}
     bkey = max(cand, key=lambda k: cand[k]["all"])
     report["selected"] = {"config": bkey, "val_all": cand[bkey]["all"],
                           "val_b0": cand[bkey]["b0_top1"]}
@@ -180,8 +173,7 @@ def main():
         report["navtest_grid_posthoc"] = nres
         if args.diagnose and "subs" in nt.files:
             subs = nt["subs"]
-            for (k, m, eps, qthr, bg, rows) in diag:
-                kk = f"K{k}/m{m}/e{eps}/q{q}/b0g{bg}"
+            for (kk, rows) in diag:
                 if kk != bkey:
                     continue
                 for r in rows:
