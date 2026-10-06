@@ -240,6 +240,8 @@ def main():
                    help="restrict Delta+argmax to top-K B0-logit candidates")
     p.add_argument("--gate", action="store_true",
                    help="scene-level sigmoid gate on Delta")
+    p.add_argument("--gate_bias", type=float, default=-2.0,
+                   help="initial bias of the gate logit (g=sigmoid(bias) at start)")
     p.add_argument("--lc_sg", action="store_true",
                    help="stop-gradient on shuffled-memory branch of L_c")
     p.add_argument("--grad_clip", type=float, default=0.0,
@@ -288,7 +290,8 @@ def main():
     delta = MemoryDelta(no_latent=args.no_latent,
                         readout=args.readout,
                         delta_cap=args.delta_cap,
-                        gate=args.gate).to(device)
+                        gate=args.gate,
+                        gate_bias=args.gate_bias).to(device)
     if args.key_ckpt:
         keynet.load_state_dict(torch.load(args.key_ckpt, map_location="cpu"))
         print(f"[mem] loaded key_ckpt {args.key_ckpt}", flush=True)

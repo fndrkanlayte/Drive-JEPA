@@ -106,7 +106,8 @@ class MemoryDelta(nn.Module):
 
     def __init__(self, d: int = D_SCENE, n_heads: int = 4,
                  no_latent: bool = False, readout: str = "resid",
-                 delta_cap: float = 1.0, gate: bool = False):
+                 delta_cap: float = 1.0, gate: bool = False,
+                 gate_bias: float = -2.0):
         super().__init__()
         self.no_latent = no_latent
         self.readout = readout
@@ -125,7 +126,7 @@ class MemoryDelta(nn.Module):
         self.gate_lin = nn.Linear(3, 1) if gate else None
         if self.gate_lin is not None:
             nn.init.zeros_(self.gate_lin.weight)
-            nn.init.constant_(self.gate_lin.bias, -2.0)
+            nn.init.constant_(self.gate_lin.bias, gate_bias)
         self.last_gate = None
 
     def forward(self, a: torch.Tensor, yhat_flat: torch.Tensor,
