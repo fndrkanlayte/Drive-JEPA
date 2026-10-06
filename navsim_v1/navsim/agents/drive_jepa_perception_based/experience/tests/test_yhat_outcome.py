@@ -351,3 +351,29 @@ def test_make_key_variants():
     assert ka.shape == (n, L + (S - 1) * L)
     np.testing.assert_allclose(
         np.linalg.norm(ka[:, :L], axis=1), 1.0, atol=1e-4)
+
+
+def test_combine_select_degenerates_to_b0():
+    """tau=0 (only B0 survives the filter) or m=inf (margin unreachable)
+    must reproduce B0's argmax pick exactly."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]
+                           / "scripts" / "experience"))
+    import numpy as np
+    from combine_select import pick_one, evaluate, b0_wrong_masks
+
+    rng = np.random.default_rng(3)
+    S, K = 16, 32
+    pdm = rng.random((S, K)).astype(np.float32)
+    fhat = rng.random((S, K)).astype(np.float32)
+    pun = rng.random((S, K)).astype(np.float32)
+    for s in range(S):
+        t1 = int(np.argmax(pdm[s]))
+        assert pick_one(pdm[s], fhat[s], pun[s], 8, 0.0, 0.0) == t1
+        assert pick_one(pdm[s], fhat[s], pun[s], 8, 0.2, np.inf) == t1
+    z = {"pdm": pdm, "final": rng.random((S, K)).astype(np.float32),
+         "rare10": np.zeros(S, bool)}
+    r = evaluate(z, pun, fhat, 8, 0.0, 0.0, b0_wrong_masks(z))
+    np.testing.assert_allclose(r["all"], r["b0_top1"])
+    assert r["sw"] == 0.0
