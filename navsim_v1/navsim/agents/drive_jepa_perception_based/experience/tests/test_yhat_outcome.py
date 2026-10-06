@@ -178,6 +178,7 @@ def test_collect_bank_ragged_log_alignment():
                     proposal_feature=rng.normal(size=(K, D)).astype(np.float32),
                     proposals=rng.normal(size=(K, 8, 3)).astype(np.float32),
                     pdm_score=rng.random(K).astype(np.float32),
+                    pred_logit=rng.normal(size=(K, 6)).astype(np.float32),
                     outcomes=rng.normal(size=(K, 18)).astype(np.float32),
                     labels=rng.random((K, 6)).astype(np.float32))
 
