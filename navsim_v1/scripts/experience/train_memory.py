@@ -485,7 +485,7 @@ def main():
                 st["n_wrong"] += parts["n_wrong"]
                 st["dstd"] += float((dl - dl.mean(1, keepdim=True))
                                    .std(1).mean())
-                st["flip"] += float((scores.argmax(1) != b0_pick)
+                st["flip"] += float((scores.argmax(1).cpu() != b0_pick)
                                     .float().mean())
                 st["cnt"] += 1
                 if nb and nb % 100 == 0:
