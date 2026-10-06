@@ -88,14 +88,29 @@ def describe_token(task):
     desc = np.full((n_cand, top_m, NUM_DESCRIPTOR_FIELDS), np.nan,
                    dtype=np.float32)
     vmask = np.zeros((n_cand, top_m), dtype=bool)
+    main_tok = np.array([""] * n_cand, dtype=object)
+    main_noatt = np.full((n_cand, NUM_DESCRIPTOR_FIELDS), np.nan,
+                         dtype=np.float32)
+    main_tok_noatt = np.array([""] * n_cand, dtype=object)
+    fault_flag = np.zeros(n_cand, dtype=bool)
     for k in range(n_cand):
         row = _vehicle_descriptor_row(
             list(scorer._ego_polygons[k]), obs, uo, vtoks,
             set(att_fault[k]), set(att_ttc[k]), ego_heading, dt,
             num_steps, top_m, prefilter_dist,
         )
-        desc[k], vmask[k] = row[0], row[1]
-    return token, desc, vmask
+        (desc[k], vmask[k], main_tok[k], main_noatt[k],
+         main_tok_noatt[k], fault_flag[k]) = row
+    aux = dict(
+        main_vehicle_token=main_tok, main_desc_noatt=main_noatt,
+        main_vehicle_token_noatt=main_tok_noatt,
+        fault_vehicle_flag=fault_flag,
+        att_fault_tokens=np.array([";".join(x) for x in att_fault],
+                                  dtype=object),
+        att_ttc_tokens=np.array([";".join(x) for x in att_ttc],
+                                dtype=object),
+    )
+    return token, desc, vmask, aux
 
 
 def describe_token_safe(task):
@@ -103,7 +118,7 @@ def describe_token_safe(task):
         return describe_token(task)
     except Exception:
         traceback.print_exc()
-        return task[0], None, None
+        return task[0], None, None, None
 
 
 def load_bank(bank_path):
@@ -129,7 +144,7 @@ def check_consistency(export_dir, labels_dir, cache_map, n_scenes, top_m,
             continue
         rec = np.load(rec_f, allow_pickle=True)
         lab = np.load(lf, allow_pickle=True)
-        _, desc, vmask = describe_token(
+        _, desc, vmask, _aux = describe_token(
             (tok, rec["proposals"], cache_map[tok], top_m, prefilter_dist))
         ref_d = np.asarray(lab["descriptors"], dtype=np.float32)
         ref_m = np.asarray(lab["vehicle_mask"], dtype=bool)
@@ -187,7 +202,7 @@ if __name__ == "__main__":
     n_done = n_err = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         for fut_res in ex.map(describe_token_safe, tasks, chunksize=4):
-            tok, desc, vmask = fut_res
+            tok, desc, vmask, _aux = fut_res
             if desc is None:
                 n_err += 1
                 continue
