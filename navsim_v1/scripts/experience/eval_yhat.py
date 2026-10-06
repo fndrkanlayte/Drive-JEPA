@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,18 +54,27 @@ from eval_ewm import (  # noqa: E402
 
 @torch.no_grad()
 def collect_query(model, loader, device):
-    """-> y_ego (S,K,L), labels (S,K,6), pdm (S,K), log per scene (S,)."""
-    ys, ll, pp, lg, pl = [], [], [], [], []
+    """-> y_full (S,K,n_sl,L), slot_logit (S,K,n_ag) or None,
+       labels (S,K,6), pdm (S,K), log per scene (S,), pred_logit.
+
+    For unstructured models y_hat is (B,K,L) and we add a length-1 slot
+    axis so downstream code can treat both cases uniformly."""
+    ys, sl_, ll, pp, lg, pl = [], [], [], [], [], []
     for b in loader:
         out = model(b["image_feature"].to(device),
                     b["proposal_feature"].to(device),
                     b["proposals"].to(device))
-        ys.append(out["y_hat"][:, :, 0].float().cpu().numpy())
+        yh = out["y_hat"].float().cpu().numpy()
+        ys.append(yh if yh.ndim == 4 else yh[:, :, None, :])
+        if "slot_logit" in out:
+            sl_.append(out["slot_logit"].float().cpu().numpy())
         ll.append(b["labels"].numpy())
         pp.append(b["pdm_score"].numpy())
         pl.append(b["pred_logit"].numpy())
         lg.extend(b["log_names"])
-    return (np.concatenate(ys), np.concatenate(ll), np.concatenate(pp),
+    return (np.concatenate(ys),
+            np.concatenate(sl_) if sl_ else None,
+            np.concatenate(ll), np.concatenate(pp),
             np.asarray(lg), np.concatenate(pl))
 
 
@@ -76,12 +86,16 @@ def collect_bank(model, loader, device, bank=None):
     forwarded as extra candidates (model must be no_pfeat) and appended with
     their true subscore finals.
     """
-    ys, fin, lg, sc, sub = [], [], [], [], []
+    ys, sl_, fin, lg, sc, sub = [], [], [], [], [], []
     for b in loader:
         img = b["image_feature"].to(device)
         out = model(img, b["proposal_feature"].to(device),
                     b["proposals"].to(device))
-        ys.append(out["y_hat"][:, :, 0].float().cpu().numpy())
+        yh = out["y_hat"].float().cpu().numpy()
+        ys.append(yh if yh.ndim == 4 else yh[:, :, None, :])
+        if "slot_logit" in out:
+            sl_.append(out["slot_logit"].float().cpu().numpy()
+                       .reshape(-1, out["slot_logit"].shape[-1]))
         fin.append(b["labels"][..., 5].numpy())
         sub.append(b["labels"].numpy().reshape(-1, 6))
         for i, ln in enumerate(b["log_names"]):
@@ -105,7 +119,11 @@ def collect_bank(model, loader, device, bank=None):
                     bt = torch.from_numpy(np.concatenate(bt_list)).float().to(device)
                     out2 = model(im, torch.zeros(B, lens[0], 256, device=device),
                                  bt.view(B, lens[0], 8, 3))
-                    yb = out2["y_hat"][:, :, 0].float().cpu().numpy()
+                    yb = out2["y_hat"].float().cpu().numpy()
+                    yb = yb if yb.ndim == 4 else yb[:, :, None, :]
+                    if "slot_logit" in out2:
+                        sl_.append(out2["slot_logit"].float().cpu().numpy()
+                                   .reshape(-1, out2["slot_logit"].shape[-1]))
                     for i, s in enumerate(have):
                         ys.append(yb[i])
                         fin.append(np.asarray(bs_list[i])[:, 5])
@@ -118,12 +136,19 @@ def collect_bank(model, loader, device, bank=None):
                         out2 = model(im[i:i + 1],
                                      torch.zeros(1, tr.shape[0], 256, device=device),
                                      tr.unsqueeze(0))
-                        ys.append(out2["y_hat"][0, :, 0].float().cpu().numpy())
+                        yh2 = out2["y_hat"].float().cpu().numpy()
+                        ys.append(yh2[0] if yh2.ndim == 4
+                                  else yh2[0, :, None, :])
+                        if "slot_logit" in out2:
+                            sl_.append(out2["slot_logit"].float().cpu().numpy()
+                                       .reshape(-1, out2["slot_logit"].shape[-1]))
                         fin.append(np.asarray(bs_list[i])[:, 5])
                         sub.append(np.asarray(bs_list[i])[:, :6])
                         lg.extend([b["log_names"][s]] * lens[i])
                         sc.extend([b["tokens"][s]] * lens[i])
-    return (np.concatenate([a.reshape(-1, a.shape[-1]) for a in ys]),
+    return (np.concatenate([a.reshape(-1, a.shape[-2], a.shape[-1])
+                            for a in ys]),
+            np.concatenate(sl_) if sl_ else None,
             np.concatenate([np.asarray(f).reshape(-1) for f in fin]),
             np.asarray(lg), np.asarray(sc),
             np.concatenate(sub).astype(np.float32))
@@ -228,6 +253,37 @@ def dump_tokens(ds):
     return [it[0] for it in ds.items]
 
 
+def slot_stats(b_y_full):
+    """Whitening stats per slot from the train memory (N,n_sl,L)."""
+    return {"eg_mu": b_y_full[:, 0].mean(0),
+            "eg_sd": b_y_full[:, 0].std(0) + 1e-6,
+            "ag_mu": b_y_full[:, 1:].mean(0),
+            "ag_sd": b_y_full[:, 1:].std(0) + 1e-6}
+
+
+def make_key(y_full, slot_logit, key, stats=None):
+    """Retrieval key per candidate.
+
+    ego:        slot-0 vector, returned unchanged (knn_readout whitens).
+    agent:      per-slot whiten (bank stats), * sigmoid(slot_logit), concat
+                -> already whitened, call knn_readout with whiten='off'.
+    ego_agent:  ego whitened L2-normed concat agent-key L2-normed.
+    """
+    if key == "ego":
+        return y_full[:, 0]
+    ag = (y_full[:, 1:] - stats["ag_mu"]) / stats["ag_sd"]
+    if slot_logit is not None:
+        p = 1.0 / (1.0 + np.exp(-slot_logit))
+        ag = ag * p[..., None]
+    agk = ag.reshape(len(y_full), -1)
+    if key == "agent":
+        return agk
+    eg = (y_full[:, 0] - stats["eg_mu"]) / stats["eg_sd"]
+    eg = eg / (np.linalg.norm(eg, axis=1, keepdims=True) + 1e-8)
+    agn = agk / (np.linalg.norm(agk, axis=1, keepdims=True) + 1e-8)
+    return np.concatenate([eg, agn], axis=1)
+
+
 def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu",
              whiten="meanstd"):
     b_subs = np.zeros((len(b_fin), 6), np.float32)
@@ -236,18 +292,22 @@ def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu",
                        whiten=whiten)["fhat"]
 
 
-def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
-                device, dumps=None, whiten="meanstd"):
-    """bank_variants: {name: (b_y, b_fin, b_logs, b_scene)}"""
+def run_metrics(tag, y_ego, q_sl, labels, pdm, q_logs, bank_variants, tert,
+                rare10, device, dumps=None, whiten="meanstd", key="ego"):
+    """bank_variants: {name: (b_y_full, b_sl, b_fin, b_logs, b_scene, b_subs)}
+
+    y_ego is the full-slot query tensor (S,K,n_sl,L); q_sl its slot logits
+    (S,K,n_ag) or None."""
     res = {}
     S, K = labels.shape[:2]
 
-    # M1a: within-scene action sensitivity
-    sp, nok = action_sensitivity(y_ego, labels)
+    # M1a: within-scene action sensitivity (always on the ego slot)
+    sp, nok = action_sensitivity(y_ego[:, :, 0], labels)
     res["M1_action_sensitivity"] = dict(spearman=sp, n_scenes=nok)
 
     # candidate-level flat arrays for kNN
-    q_y = y_ego.reshape(-1, y_ego.shape[-1])
+    q_yf = y_ego.reshape(-1, y_ego.shape[-2], y_ego.shape[-1])
+    q_slf = q_sl.reshape(-1, q_sl.shape[-1]) if q_sl is not None else None
     q_fin = labels[..., 5].reshape(-1)
     q_cand_logs = np.repeat(q_logs, K)
 
@@ -261,9 +321,17 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
                 labels[s, tk, 5].max() - 1e-6
         b0_wrong[Ksel] = m
 
-    for bname, (b_y, b_fin, b_logs, b_scene, b_subs) in bank_variants.items():
-        rd = knn_readout(q_y, q_cand_logs, b_y, b_subs, b_logs, device=device,
-                         whiten=whiten)
+    for bname, (b_yf, b_sl, b_fin, b_logs, b_scene,
+                b_subs) in bank_variants.items():
+        if key == "ego":
+            q_key, b_key, wmode = q_yf[:, 0], b_yf[:, 0], whiten
+        else:
+            st = slot_stats(b_yf)
+            q_key = make_key(q_yf, q_slf, key, st)
+            b_key = make_key(b_yf, b_sl, key, st)
+            wmode = "off"
+        rd = knn_readout(q_key, q_cand_logs, b_key, b_subs, b_logs,
+                         device=device, whiten=wmode)
         fhat_flat = rd["fhat"]
         fhat = fhat_flat.reshape(S, K)
         # shuffle control: permute whole subscore rows within each bank SCENE
@@ -272,8 +340,8 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
         for sc in np.unique(b_scene):
             m = b_scene == sc
             b_subs_sh[m] = b_subs_sh[m][rng.permutation(int(m.sum()))]
-        rd_sh = knn_readout(q_y, q_cand_logs, b_y, b_subs_sh, b_logs,
-                            device=device, whiten=whiten)
+        rd_sh = knn_readout(q_key, q_cand_logs, b_key, b_subs_sh, b_logs,
+                            device=device, whiten=wmode)
         fhat_sh = rd_sh["fhat"].reshape(S, K)
         if dumps is not None:
             d = {"fhat": fhat.astype(np.float32),
@@ -347,6 +415,13 @@ def main():
     p.add_argument("--whiten", default="meanstd",
                    choices=("meanstd", "off"),
                    help="ŷ centre+scale by train-memory stats before cosine")
+    p.add_argument("--key", default="ego",
+                   choices=("ego", "agent", "ego_agent"),
+                   help="retrieval key: ego slot only (default), agent slots "
+                        "1..4 whitened+exist-weighted concat, or both")
+    p.add_argument("--mem_cache_dir", default=None,
+                   help="cache train-memory y_hat (all slots) per run/bank "
+                        "variant as npz so later runs/splits reuse it")
     p.add_argument("--dump_npz", default=None,
                    help="per-query dump: tokens/pdm/final/fhat(+shuf)/rare10 "
                         "per run & bank variant, for rerank_yhat.py")
@@ -387,29 +462,51 @@ def main():
     pdm_all, final_all, b0_all, labels_full = {}, {}, {}, {}
     for run in args.runs.split(","):
         model, direct, tag = load_model(Path(run), device, ckpt_file=args.ckpt)
-        y_ego, labels, pdm, q_logs, pred_logit = collect_query(
+        y_full, q_sl, labels, pdm, q_logs, pred_logit = collect_query(
             model, q_loader, device)
+        if args.key != "ego" and y_full.shape[2] == 1:
+            raise ValueError(f"--key {args.key} needs agent slots; model "
+                             f"{tag} has an unstructured y_hat")
         pdm_all[tag] = pdm.copy()
         final_all[tag] = labels[..., 5].copy()
         labels_full[tag] = labels.copy()
         b0_all[tag] = (1.0 / (1.0 + np.exp(-pred_logit))).astype(np.float32)
 
-        # bank memory: train split B0 proposals
-        print(f"[{tag}] collecting train bank ...", flush=True)
-        b_y, b_fin, b_logs, b_scene, b_subs = collect_bank(
-            model, ref_loader, device)
-        variants = {"b0prop": (b_y, b_fin, b_logs, b_scene, b_subs)}
+        safe_tag = tag.replace(":", "_").replace("/", "_")
+
+        def bank_variant(bname, use_bank):
+            cp = None
+            if args.mem_cache_dir:
+                cp = (Path(args.mem_cache_dir)
+                      / f"mem_{safe_tag}_{bname}.npz")
+                if cp.exists():
+                    z = np.load(cp, allow_pickle=True)
+                    return (z["y_full"],
+                            z["slot_logit"] if "slot_logit" in z.files
+                            else None,
+                            z["fin"], z["logs"], z["scene"], z["subs"])
+            print(f"[{tag}] collecting train bank"
+                  + (" + clover trajs ..." if use_bank else " ..."),
+                  flush=True)
+            by, bs_, bf, bl, bsc, bu = collect_bank(
+                model, ref_loader, device, bank=bank if use_bank else None)
+            if cp is not None:
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cp.with_name(cp.stem + ".tmp.npz")
+                np.savez(tmp, y_full=by, fin=bf, logs=bl, scene=bsc, subs=bu,
+                         **({"slot_logit": bs_} if bs_ is not None else {}))
+                os.replace(tmp, cp)
+            return (by, bs_, bf, bl, bsc, bu)
+
+        variants = {"b0prop": bank_variant("b0prop", False)}
         if bank is not None and getattr(model.action, "no_pfeat", False):
-            print(f"[{tag}] collecting train bank + clover trajs ...", flush=True)
-            # second pass reusing same loader for bank trajectories
-            by2, bf2, bl2, bs2, bu2 = collect_bank(model, ref_loader, device,
-                                                   bank=bank)
-            variants["b0prop+bank"] = (by2, bf2, bl2, bs2, bu2)
+            variants["b0prop+bank"] = bank_variant("b0prop+bank", True)
 
         dumps = {} if args.dump_npz else None
-        report[tag] = run_metrics(tag, y_ego, labels, pdm.copy(), q_logs, variants,
-                                  tert, rare10, device, dumps=dumps,
-                                  whiten=args.whiten)
+        report[tag] = run_metrics(tag, y_full, q_sl, labels, pdm.copy(),
+                                  q_logs, variants, tert, rare10, device,
+                                  dumps=dumps, whiten=args.whiten,
+                                  key=args.key)
         if dumps is not None:
             dump_runs[tag] = dumps
 

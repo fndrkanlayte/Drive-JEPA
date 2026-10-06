@@ -189,10 +189,12 @@ def test_collect_bank_ragged_log_alignment():
             "tB": (rng.normal(size=(5, 8, 3)).astype(np.float32),
                    rng.random((5, 6)).astype(np.float32))}
     model = build_model("b3", 1, use_future=False, no_pfeat=True).eval()
-    y, fin, lg, sc, subs = collect_bank(model, loader, torch.device("cpu"),
-                                       bank=bank)
+    y, sl, fin, lg, sc, subs = collect_bank(model, loader, torch.device("cpu"),
+                                           bank=bank)
 
     assert len(lg) == len(y) == 2 * K + 3 + 5
+    assert y.shape[1] == 5                     # ego + 4 agent slots kept
+    assert sl.shape == (2 * K + 3 + 5, 4)
     assert subs.shape == (2 * K + 3 + 5, 6)
     assert list(lg[:K]) == ["logA"] * K
     assert list(lg[K:2 * K]) == ["logB"] * K
@@ -314,3 +316,38 @@ def test_readout_select_rules():
                               [1., 1., 1., 1., 1., 1.]]])}
     d = danger_auc(z, k=4)
     assert d["n_danger"] == 1 and abs(d["auc"] - 1.0) < 1e-9
+
+
+def test_make_key_variants():
+    """ego returns the slot-0 vector unchanged; agent whitens per slot and
+    scales by sigmoid(exist); ego_agent concatenates unit-norm halves."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]
+                           / "scripts" / "experience"))
+    import numpy as np
+    from eval_yhat import make_key, slot_stats
+
+    rng = np.random.default_rng(2)
+    n, S, L = 32, 5, 64
+    y = rng.normal(size=(n, S, L)).astype(np.float32)
+    st = slot_stats(y)
+    np.testing.assert_allclose(make_key(y, None, "ego"), y[:, 0])
+
+    # no exist weighting -> concat of per-slot whitened vectors
+    k = make_key(y, None, "agent", st)
+    assert k.shape == (n, (S - 1) * L)
+    np.testing.assert_allclose(
+        k[:, :L], (y[:, 1] - st["ag_mu"][0]) / st["ag_sd"][0], atol=1e-5)
+
+    # exist -> -inf zeroes that slot's block
+    sl = np.zeros((n, S - 1), np.float32)
+    sl[:, 2] = -30.0
+    k2 = make_key(y, sl, "agent", st)
+    np.testing.assert_allclose(k2[:, 2 * L:3 * L], 0.0, atol=1e-4)
+    np.testing.assert_allclose(k2[:, :L], k[:, :L] * 0.5, atol=1e-4)
+
+    ka = make_key(y, None, "ego_agent", st)
+    assert ka.shape == (n, L + (S - 1) * L)
+    np.testing.assert_allclose(
+        np.linalg.norm(ka[:, :L], axis=1), 1.0, atol=1e-4)
