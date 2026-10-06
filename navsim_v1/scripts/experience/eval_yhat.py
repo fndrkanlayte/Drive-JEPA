@@ -138,11 +138,11 @@ def action_sensitivity(y_ego, labels):
     return float(np.nanmean(vals)), int(np.sum(~np.isnan(vals)))
 
 
-def pairwise_auc(pred, true, mask):
+def pairwise_auc(pred, true):
     """P(pred orders a pair the same as true) over pairs with true_i != true_j."""
     a, b = np.triu_indices(len(pred), 1)
     d = true[a] - true[b]
-    keep = (d != 0) & mask
+    keep = d != 0
     a, b, d = a[keep], b[keep], d[keep]
     if len(d) == 0:
         return float("nan"), 0
@@ -239,10 +239,8 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
                 npairs = 0
                 for s in np.where(msk)[0]:
                     tk = topk_indices(pdm[s], Ksel)
-                    af, n1 = pairwise_auc(fhat[s][tk], labels[s, tk, 5],
-                                          np.ones(len(tk), bool))
-                    ab, n2 = pairwise_auc(pdm[s][tk], labels[s, tk, 5],
-                                          np.ones(len(tk), bool))
+                    af, n1 = pairwise_auc(fhat[s][tk], labels[s, tk, 5])
+                    ab, n2 = pairwise_auc(pdm[s][tk], labels[s, tk, 5])
                     if not np.isnan(af):
                         auc_f.append(af); npairs += n1
                     if not np.isnan(ab):
@@ -259,8 +257,7 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
         auc_c = []
         for s in range(S):
             tk = topk_indices(pdm[s], 8)
-            af, _ = pairwise_auc(fhat_sh[s][tk], labels[s, tk, 5],
-                                 np.ones(len(tk), bool))
+            af, _ = pairwise_auc(fhat_sh[s][tk], labels[s, tk, 5])
             if not np.isnan(af):
                 auc_c.append(af)
         res[f"M1_knn_finalMAE/{bname}"] = mae
