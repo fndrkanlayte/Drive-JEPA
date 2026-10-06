@@ -200,3 +200,13 @@ def test_collect_bank_ragged_log_alignment():
     assert list(sc[2 * K + 3:]) == ["tB"] * 5
     assert np.allclose(fin[2 * K:2 * K + 3], bank["tA"][1][:, 5])
     assert np.allclose(fin[2 * K + 3:], bank["tB"][1][:, 5])
+
+
+def test_bank_filter_tokens_excludes_uncovered():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "scripts" / "experience"))
+    from train_ewm import bank_filter_tokens
+    bank = {"t1": (np.zeros((2, 8, 3)), np.zeros((2, 6))), "t3": None}
+    toks = ["t0", "t1", "t2", "t3"]
+    out = bank_filter_tokens(toks, bank)
+    # t3 is in bank but maps to None -> also excluded; t0/t2 absent -> excluded
+    assert out == ["t1"]

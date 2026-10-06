@@ -73,6 +73,14 @@ def outcome_features(labels: dict) -> np.ndarray:
     return np.concatenate([timing, sub[:, :5], sub[:, 5:6]], axis=-1)
 
 
+def bank_filter_tokens(tokens, bank: dict):
+    """Keep only tokens the bank covers. Scenes without bank entries would
+    emit all-zero fake bank candidates (zero trajs, zero subscores) that would
+    otherwise enter l2/bce_hat/rel/xs supervision."""
+    return [t for t in tokens
+            if bank.get(t) is not None and len(bank[t][0]) > 0]
+
+
 def load_bank_npz(path: str) -> dict:
     """bank_ours.npz -> {token: (trajs (N,8,3), subs (N,6))}."""
     z = np.load(path, allow_pickle=True)
@@ -371,6 +379,8 @@ def main() -> None:
     if args.model == "b3" and args.future_map:
         fmap = json.load(open(args.future_map))["map"]
     bank = load_bank_npz(args.bank_npz) if args.bank_npz else None
+    if bank is not None:
+        train_tokens = bank_filter_tokens(train_tokens, bank)
     train_ds = LatentDataset(train_tokens, lat_index, labels_dir, structured, fmap,
                              bank=bank, bank_per_scene=args.bank_per_scene)
     val_ds = LatentDataset(val_tokens, lat_index, labels_dir, structured, None)
