@@ -511,7 +511,7 @@ def main():
                     st["gw"] += float(gv[wr].sum()); st["gnw"] += int(wr.sum())
                     st["gc"] += float(gv[~wr].sum()); st["gnc"] += int((~wr).sum())
                 st["cnt"] += 1
-                if nb and nb % 100 == 0:
+                if nb and nb % 25 == 0:
                     c = st["cnt"]
                     gw = st["gw"] / max(st["gnw"], 1)
                     gc = st["gc"] / max(st["gnc"], 1)
