@@ -193,7 +193,7 @@ def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu"):
 
 
 def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
-                device):
+                device, dumps=None):
     """bank_variants: {name: (b_y, b_fin, b_logs, b_scene)}"""
     res = {}
     S, K = labels.shape[:2]
@@ -228,6 +228,9 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
             b_fin_sh[m] = rng.permutation(b_fin[m])
         fhat_sh = knn_fhat(q_y, q_cand_logs, b_y, b_fin_sh, b_logs, device=device)
         fhat_sh = fhat_sh.reshape(S, K)
+        if dumps is not None:
+            dumps[bname] = {"fhat": fhat.astype(np.float32),
+                            "fhat_shuf": fhat_sh.astype(np.float32)}
 
         # M1b: cross-log kNN finalMAE
         mae = float(np.abs(fhat_flat - q_fin).mean())
@@ -284,6 +287,9 @@ def main():
     p.add_argument("--runs", required=True, help="comma-separated run dirs")
     p.add_argument("--ckpt", default="model.pt")
     p.add_argument("--bank_npz", default=None)
+    p.add_argument("--dump_npz", default=None,
+                   help="per-query dump: tokens/pdm/final/fhat(+shuf)/rare10 "
+                        "per run & bank variant, for rerank_yhat.py")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--out_json", default=None)
@@ -317,9 +323,13 @@ def main():
 
     bank = load_bank_npz(args.bank_npz) if args.bank_npz else None
     report = {}
+    dump_runs = {}
+    pdm_all, final_all = {}, {}
     for run in args.runs.split(","):
         model, direct, tag = load_model(Path(run), device, ckpt_file=args.ckpt)
         y_ego, labels, pdm, q_logs = collect_query(model, q_loader, device)
+        pdm_all[tag] = pdm.copy()
+        final_all[tag] = labels[..., 5].copy()
 
         # bank memory: train split B0 proposals
         print(f"[{tag}] collecting train bank ...", flush=True)
@@ -332,11 +342,27 @@ def main():
                                              bank=bank)
             variants["b0prop+bank"] = (by2, bf2, bl2, bs2)
 
-        report[tag] = run_metrics(tag, y_ego, labels, pdm, q_logs, variants,
-                                  tert, rare10, device)
+        dumps = {} if args.dump_npz else None
+        report[tag] = run_metrics(tag, y_ego, labels, pdm.copy(), q_logs, variants,
+                                  tert, rare10, device, dumps=dumps)
+        if dumps is not None:
+            dump_runs[tag] = dumps
 
     if args.out_json:
         Path(args.out_json).write_text(json.dumps(report, indent=1))
+    if args.dump_npz:
+        for tag, dumps in dump_runs.items():
+            pth = Path(args.dump_npz.format(tag=tag))
+            np.savez(
+                pth,
+                tokens=np.asarray(tokens),
+                rare10=rare10.astype(bool),
+                pdm=pdm_all[tag],
+                final=final_all[tag],
+                **{f"{bn}__{k}": v for bn, d in dumps.items()
+                   for k, v in d.items()},
+            )
+            print(f"[eval] dumped {pth}", flush=True)
     print(json.dumps(report, indent=1))
 
 
