@@ -75,13 +75,14 @@ def collect_bank(model, loader, device, bank=None):
     forwarded as extra candidates (model must be no_pfeat) and appended with
     their true subscore finals.
     """
-    ys, fin, lg, sc = [], [], [], []
+    ys, fin, lg, sc, sub = [], [], [], [], []
     for b in loader:
         img = b["image_feature"].to(device)
         out = model(img, b["proposal_feature"].to(device),
                     b["proposals"].to(device))
         ys.append(out["y_hat"][:, :, 0].float().cpu().numpy())
         fin.append(b["labels"][..., 5].numpy())
+        sub.append(b["labels"].numpy().reshape(-1, 6))
         for i, ln in enumerate(b["log_names"]):
             lg.extend([ln] * b["labels"].shape[1])
             sc.extend([b["tokens"][i]] * b["labels"].shape[1])
@@ -107,6 +108,7 @@ def collect_bank(model, loader, device, bank=None):
                     for i, s in enumerate(have):
                         ys.append(yb[i])
                         fin.append(np.asarray(bs_list[i])[:, 5])
+                        sub.append(np.asarray(bs_list[i])[:, :6])
                         lg.extend([b["log_names"][s]] * lens[i])
                         sc.extend([b["tokens"][s]] * lens[i])
                 else:
@@ -117,11 +119,13 @@ def collect_bank(model, loader, device, bank=None):
                                      tr.unsqueeze(0))
                         ys.append(out2["y_hat"][0, :, 0].float().cpu().numpy())
                         fin.append(np.asarray(bs_list[i])[:, 5])
+                        sub.append(np.asarray(bs_list[i])[:, :6])
                         lg.extend([b["log_names"][s]] * lens[i])
                         sc.extend([b["tokens"][s]] * lens[i])
     return (np.concatenate([a.reshape(-1, a.shape[-1]) for a in ys]),
             np.concatenate([np.asarray(f).reshape(-1) for f in fin]),
-            np.asarray(lg), np.asarray(sc))
+            np.asarray(lg), np.asarray(sc),
+            np.concatenate(sub).astype(np.float32))
 
 
 def action_sensitivity(y_ego, labels):
@@ -169,27 +173,44 @@ def topk_indices(pdm_row, k):
     return np.argpartition(-pdm_row, k - 1)[:k]
 
 
-def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu"):
-    """Per-query cross-log top-k cosine kNN -> weighted f_hat (N,)."""
+def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu"):
+    """Per-query cross-log top-k cosine kNN -> dict of weighted subscore
+    readouts: fhat (w·final), p_nc/p_dac/p_ttc (w·frac(sub<1)), f_ep (w·EP),
+    cos (mean top-k similarity, masked neighbours clamped to 0)."""
     qn = q_y / (np.linalg.norm(q_y, axis=1, keepdims=True) + 1e-8)
     bn = b_y / (np.linalg.norm(b_y, axis=1, keepdims=True) + 1e-8)
     bt = torch.from_numpy(bn).to(device)
-    bf = torch.from_numpy(b_fin).float().to(device)
+    bs = torch.from_numpy(b_subs).float().to(device)
     uniq = np.unique(np.concatenate([np.asarray(q_logs), np.asarray(b_logs)]))
     lid = {v: i for i, v in enumerate(uniq)}
     ql = torch.from_numpy(np.array([lid[v] for v in q_logs])).to(device)
     bl = torch.from_numpy(np.array([lid[v] for v in b_logs])).to(device)
-    out = np.zeros(len(qn), np.float32)
+    n = len(qn)
+    out = {k_: np.zeros(n, np.float32) for k_ in
+           ("fhat", "p_nc", "p_dac", "p_ttc", "f_ep", "cos")}
     CH = 1024
-    for s in range(0, len(qn), CH):
+    for s in range(0, n, CH):
         qc = torch.from_numpy(qn[s:s + CH]).to(device)
         sim = qc @ bt.T
         same = ql[s:s + CH, None] == bl[None, :]
         sim = sim.masked_fill(same, -1e9)
         tk = sim.topk(min(k, sim.shape[1]), dim=-1)
         w = torch.softmax(tk.values / t, dim=-1)
-        out[s:s + CH] = (w * bf[tk.indices]).sum(-1).cpu().numpy()
+        nb = bs[tk.indices]                       # (ch,k,6)
+        sl = slice(s, s + CH)
+        out["fhat"][sl] = (w * nb[..., 5]).sum(-1).cpu().numpy()
+        out["p_nc"][sl] = (w * (nb[..., 0] < 1).float()).sum(-1).cpu().numpy()
+        out["p_dac"][sl] = (w * (nb[..., 1] < 1).float()).sum(-1).cpu().numpy()
+        out["p_ttc"][sl] = (w * (nb[..., 3] < 1).float()).sum(-1).cpu().numpy()
+        out["f_ep"][sl] = (w * nb[..., 2]).sum(-1).cpu().numpy()
+        out["cos"][sl] = tk.values.clamp(-1, 1).mean(-1).cpu().numpy()
     return out
+
+
+def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu"):
+    b_subs = np.zeros((len(b_fin), 6), np.float32)
+    b_subs[:, 5] = b_fin
+    return knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k, t, device)["fhat"]
 
 
 def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
@@ -217,20 +238,26 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
                 labels[s, tk, 5].max() - 1e-6
         b0_wrong[Ksel] = m
 
-    for bname, (b_y, b_fin, b_logs, b_scene) in bank_variants.items():
-        fhat_flat = knn_fhat(q_y, q_cand_logs, b_y, b_fin, b_logs, device=device)
+    for bname, (b_y, b_fin, b_logs, b_scene, b_subs) in bank_variants.items():
+        rd = knn_readout(q_y, q_cand_logs, b_y, b_subs, b_logs, device=device)
+        fhat_flat = rd["fhat"]
         fhat = fhat_flat.reshape(S, K)
-        # shuffle control: permute finals within each bank SCENE (token)
+        # shuffle control: permute whole subscore rows within each bank SCENE
         rng = np.random.default_rng(0)
-        b_fin_sh = b_fin.copy()
+        b_subs_sh = b_subs.copy()
         for sc in np.unique(b_scene):
             m = b_scene == sc
-            b_fin_sh[m] = rng.permutation(b_fin[m])
-        fhat_sh = knn_fhat(q_y, q_cand_logs, b_y, b_fin_sh, b_logs, device=device)
-        fhat_sh = fhat_sh.reshape(S, K)
+            b_subs_sh[m] = b_subs_sh[m][rng.permutation(int(m.sum()))]
+        rd_sh = knn_readout(q_y, q_cand_logs, b_y, b_subs_sh, b_logs,
+                            device=device)
+        fhat_sh = rd_sh["fhat"].reshape(S, K)
         if dumps is not None:
-            dumps[bname] = {"fhat": fhat.astype(np.float32),
-                            "fhat_shuf": fhat_sh.astype(np.float32)}
+            d = {"fhat": fhat.astype(np.float32),
+                 "fhat_shuf": fhat_sh.astype(np.float32)}
+            for k_ in ("p_nc", "p_dac", "p_ttc", "f_ep", "cos"):
+                d[k_] = rd[k_].reshape(S, K).astype(np.float32)
+                d[k_ + "_shuf"] = rd_sh[k_].reshape(S, K).astype(np.float32)
+            dumps[bname] = d
 
         # M1b: cross-log kNN finalMAE
         mae = float(np.abs(fhat_flat - q_fin).mean())
@@ -333,14 +360,15 @@ def main():
 
         # bank memory: train split B0 proposals
         print(f"[{tag}] collecting train bank ...", flush=True)
-        b_y, b_fin, b_logs, b_scene = collect_bank(model, ref_loader, device)
-        variants = {"b0prop": (b_y, b_fin, b_logs, b_scene)}
+        b_y, b_fin, b_logs, b_scene, b_subs = collect_bank(
+            model, ref_loader, device)
+        variants = {"b0prop": (b_y, b_fin, b_logs, b_scene, b_subs)}
         if bank is not None and getattr(model.action, "no_pfeat", False):
             print(f"[{tag}] collecting train bank + clover trajs ...", flush=True)
             # second pass reusing same loader for bank trajectories
-            by2, bf2, bl2, bs2 = collect_bank(model, ref_loader, device,
-                                             bank=bank)
-            variants["b0prop+bank"] = (by2, bf2, bl2, bs2)
+            by2, bf2, bl2, bs2, bu2 = collect_bank(model, ref_loader, device,
+                                                   bank=bank)
+            variants["b0prop+bank"] = (by2, bf2, bl2, bs2, bu2)
 
         dumps = {} if args.dump_npz else None
         report[tag] = run_metrics(tag, y_ego, labels, pdm.copy(), q_logs, variants,

@@ -1,22 +1,26 @@
 #!/usr/bin/env python
-"""R2: does f_hat re-ranking inside B0's top-K raise true final (PDMS proxy)?
+"""R3: conservative flip re-ranking inside B0's top-K using kNN subscore
+readouts dumped by eval_yhat.py --dump_npz.
 
-Input: npz dumped by eval_yhat.py --dump_npz (per run, per bank variant):
-    tokens (S,), rare10 (S,), pdm (S,K), final (S,K),
-    {variant}__fhat (S,K), {variant}__fhat_shuf (S,K)
+Rule (per scene): default pick = B0's top1 by pdm. A challenger j inside
+B0's pdm top-K replaces it only if ALL hold:
+    a) fhat_j - fhat_top1 > m
+    b) p_nc_j <= p_nc_top1 + eps AND p_dac_j <= p_dac_top1 + eps
+    c) cos_j >= q_thr   (q_thr = global quantile of per-candidate cos)
+Multiple valid challengers -> pick max fhat.
 
-Rule: take B0's top-K candidates by pdm; score = z(pdm) + beta*z(fhat) where
-z is standardisation WITHIN the scene's top-K; pick argmax. Metric = mean true
-final of the pick over scene splits {all, rare10, b0_wrong(K)} plus oracle@K
-(best final in top-K) and the B0 pick (beta=0 must reproduce it).
+Metrics: mean true final of pick over {all, rare10, b0_wrong(K)} plus
+oracle@K, B0 top1, and flip stats sw/win/lose/dwin/dlose. Shuffle control
+uses the *_shuf readouts (same gate).
 
-(K, beta) are selected on the VAL dump only; navtest is reported once for the
-selected config (full grid appended, marked post-hoc).
+Grid: K {2,4,8} x m {0,.02,.05,.1} x eps {0,.05} x q-quantile {0,.25,.5}.
+(K,m,eps,q) selected on VAL by 'all' mean final ONLY; navtest reported once
+for the selected config (full grid appended, marked post-hoc).
 
 Usage:
     python scripts/experience/rerank_yhat.py \
         --val_npz val_dump.npz --navtest_npz navtest_dump.npz \
-        --variant b0prop --out_json rerank_yhat.json
+        --variant b0prop --out_json rerank_r3.json
 """
 
 import argparse
@@ -26,57 +30,83 @@ from pathlib import Path
 import numpy as np
 
 KS = (2, 4, 8)
-BETAS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
+MS = (0.0, 0.02, 0.05, 0.1)
+EPS = (0.0, 0.05)
+QS = (0.0, 0.25, 0.5)
 
 
-def topk_mask(pdm_row, k):
-    tk = np.argpartition(-pdm_row, k - 1)[:k]
-    return tk
+def topk_idx(pdm_row, k):
+    return np.argpartition(-pdm_row, k - 1)[:k]
 
 
-def zscore(v):
-    s = v.std()
-    return (v - v.mean()) / (s + 1e-8)
-
-
-def eval_config(pdm, final, fhat, splits, k, beta):
-    """Mean true final of fused pick within top-K; splits = {name: mask(S)}."""
+def flip_eval(pdm, final, fhat, pnc, pdac, cos, splits, k, m, eps, qthr):
     S = len(pdm)
+    pick = np.empty(S, np.int64)
+    for s in range(S):
+        t1 = int(pdm[s].argmax())
+        tk = topk_idx(pdm[s], k)
+        best, best_f = t1, -np.inf
+        for j in tk:
+            j = int(j)
+            if j == t1:
+                continue
+            if (fhat[s, j] - fhat[s, t1] > m
+                    and pnc[s, j] <= pnc[s, t1] + eps
+                    and pdac[s, j] <= pdac[s, t1] + eps
+                    and cos[s, j] >= qthr
+                    and fhat[s, j] > best_f):
+                best, best_f = j, fhat[s, j]
+        pick[s] = best
     out = {}
+    delta = final[np.arange(S), pick] - final[np.arange(S),
+                                               pdm.argmax(1)]
+    sw = pick != pdm.argmax(1)
+    win = sw & (delta > 1e-6)
+    lose = sw & (delta < -1e-6)
     for name, msk in splits.items():
         idx = np.where(msk)[0]
-        vals = []
-        for s in idx:
-            tk = topk_mask(pdm[s], k)
-            sc = zscore(pdm[s][tk]) + beta * zscore(fhat[s][tk])
-            pick = tk[sc.argmax()]
-            vals.append(final[s, pick])
-        out[name] = float(np.mean(vals)) if vals else float("nan")
-    # oracle and B0 within top-K (computed on 'all' for reference)
-    orac = [final[s, topk_mask(pdm[s], k)[final[s, topk_mask(pdm[s], k)].argmax()]]
-            for s in range(S)]
-    b0 = [final[s, pdm[s].argmax()] for s in range(S)]
+        out[name] = float(np.mean(final[idx, pick[idx]])) if len(idx) \
+            else float("nan")
+    out["sw"] = float(sw.mean())
+    out["win"] = float(win.sum() / max(sw.sum(), 1))
+    out["lose"] = float(lose.sum() / max(sw.sum(), 1))
+    out["dwin"] = float(delta[win].mean()) if win.any() else 0.0
+    out["dlose"] = float(delta[lose].mean()) if lose.any() else 0.0
+    # bounds
+    orac = [final[s, topk_idx(pdm[s], k)[
+        final[s, topk_idx(pdm[s], k)].argmax()]] for s in range(S)]
     out["oracle@K"] = float(np.mean(orac))
-    out["b0_top1"] = float(np.mean(b0))
+    out["b0_top1"] = float(final[np.arange(S), pdm.argmax(1)].mean())
     return out
 
 
-def grid_eval(npz, variant):
+def grid(npz, variant):
     pdm, final = npz["pdm"], npz["final"]
     rare10 = npz["rare10"].astype(bool)
-    fhat = npz[f"{variant}__fhat"]
-    fhat_sh = npz[f"{variant}__fhat_shuf"]
+    pre = f"{variant}__"
+    fhat = npz[pre + "fhat"]
+    pnc = npz[pre + "p_nc"]
+    pdac = npz[pre + "p_dac"]
+    cos = npz[pre + "cos"]
+    fs, pnc_s, pdac_s = (npz[pre + "fhat_shuf"], npz[pre + "p_nc_shuf"],
+                         npz[pre + "p_dac_shuf"])
     res = {}
     for k in KS:
-        b0_wrong = np.array([
-            final[s, pdm[s].argmax()] < final[s, topk_mask(pdm[s], k)].max() - 1e-6
+        b0w = np.array([
+            final[s, pdm[s].argmax()] <
+            final[s, topk_idx(pdm[s], k)].max() - 1e-6
             for s in range(len(pdm))])
         splits = {"all": np.ones(len(pdm), bool), "rare10": rare10,
-                  "b0_wrong": b0_wrong}
-        for beta in BETAS:
-            res[f"K{k}/b{beta}"] = eval_config(pdm, final, fhat, splits, k, beta)
-        # shuffle control at beta=1 reference + best-beta slot filled later
-        res[f"K{k}/shuf_b1"] = eval_config(pdm, final, fhat_sh, splits, k, 1.0)
+                  "b0_wrong": b0w}
+        for m in MS:
+            for eps in EPS:
+                for q in QS:
+                    qt = float(np.quantile(cos, q)) if q > 0 else -np.inf
+                    key = f"K{k}/m{m}/e{eps}/q{q}"
+                    res[key] = flip_eval(pdm, final, fhat, pnc, pdac, cos,
+                                         splits, k, m, eps, qt)
+        res[f"K{k}/shuf"] = flip_eval(pdm, final, fs, pnc_s, pdac_s, cos,
+                                      splits, k, 0.02, 0.0, -np.inf)
     return res
 
 
@@ -89,26 +119,21 @@ def main():
     args = p.parse_args()
 
     val = np.load(args.val_npz, allow_pickle=True)
-    vres = grid_eval(val, args.variant)
+    vres = grid(val, args.variant)
     report = {"variant": args.variant, "val": vres}
 
-    # select (K, beta) on val: maximise b0_wrong gain over B0 top1
-    best, best_gain = None, -1
-    for k in KS:
-        base = vres[f"K{k}/b0.0"]["b0_wrong"]
-        for beta in BETAS[1:]:
-            g = vres[f"K{k}/b{beta}"]["b0_wrong"] - base
-            if g > best_gain:
-                best_gain, best = g, (k, beta)
-    k, beta = best
-    report["selected"] = {"K": k, "beta": beta,
-                          "val_b0_wrong_gain": best_gain}
+    # select on val 'all' mean final (exclude shuf rows)
+    cand = {k: v for k, v in vres.items() if "/shuf" not in k}
+    bkey = max(cand, key=lambda k: cand[k]["all"])
+    report["selected"] = {"config": bkey, "val_all": cand[bkey]["all"],
+                          "val_b0": cand[bkey]["b0_top1"]}
 
     if args.navtest_npz:
         nt = np.load(args.navtest_npz, allow_pickle=True)
-        nres = grid_eval(nt, args.variant)
-        report["navtest_selected"] = nres[f"K{k}/b{beta}"]
-        report["navtest_shuf_control"] = nres[f"K{k}/shuf_b1"]
+        nres = grid(nt, args.variant)
+        report["navtest_selected"] = {"config": bkey, **nres[bkey]}
+        k_of_sel = bkey.split("/")[0]
+        report["navtest_shuf_control"] = nres[f"{k_of_sel}/shuf"]
         report["navtest_grid_posthoc"] = nres
 
     txt = json.dumps(report, indent=1)

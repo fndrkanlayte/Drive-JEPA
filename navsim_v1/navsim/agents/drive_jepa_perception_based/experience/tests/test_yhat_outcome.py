@@ -188,9 +188,11 @@ def test_collect_bank_ragged_log_alignment():
             "tB": (rng.normal(size=(5, 8, 3)).astype(np.float32),
                    rng.random((5, 6)).astype(np.float32))}
     model = build_model("b3", 1, use_future=False, no_pfeat=True).eval()
-    y, fin, lg, sc = collect_bank(model, loader, torch.device("cpu"), bank=bank)
+    y, fin, lg, sc, subs = collect_bank(model, loader, torch.device("cpu"),
+                                       bank=bank)
 
     assert len(lg) == len(y) == 2 * K + 3 + 5
+    assert subs.shape == (2 * K + 3 + 5, 6)
     assert list(lg[:K]) == ["logA"] * K
     assert list(lg[K:2 * K]) == ["logB"] * K
     # ragged bank rows must stay aligned to their own scene's log/token
@@ -200,6 +202,28 @@ def test_collect_bank_ragged_log_alignment():
     assert list(sc[2 * K + 3:]) == ["tB"] * 5
     assert np.allclose(fin[2 * K:2 * K + 3], bank["tA"][1][:, 5])
     assert np.allclose(fin[2 * K + 3:], bank["tB"][1][:, 5])
+    assert np.allclose(subs[2 * K:2 * K + 3], bank["tA"][1][:, :6])
+    assert np.allclose(subs[2 * K + 3:], bank["tB"][1][:, :6])
+
+
+def test_knn_readout_subscores():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "scripts" / "experience"))
+    from eval_yhat import knn_readout
+    rng = np.random.default_rng(0)
+    # two-bank candidates in another log: one all-safe, one NC=0
+    b_y = np.concatenate([np.ones((1, 4)), -np.ones((1, 4))], 0).astype(np.float32)
+    b_subs = np.array([[1, 1, .5, 1, 1, .9],
+                       [0, 1, .5, 1, 1, .1]], np.float32)
+    b_logs = np.array(["logX", "logX"])
+    q_y = np.ones((1, 4), np.float32)
+    rd = knn_readout(q_y, np.array(["Q"]), b_y, b_subs, b_logs, k=2, t=.01)
+    assert rd["fhat"][0] > .85            # weight dominated by the aligned nbr
+    assert rd["p_nc"][0] < .1
+    assert abs(rd["cos"][0]) < .1         # mean sim of (1,-1) pair
+    # all neighbours masked (same log) -> softmax falls back to uniform
+    rd2 = knn_readout(q_y, np.array(["logX"]), b_y, b_subs, b_logs, k=2, t=.01)
+    assert .45 < rd2["fhat"][0] < .55
+    assert .45 < rd2["p_nc"][0] < .55
 
 
 def test_bank_filter_tokens_excludes_uncovered():
