@@ -287,20 +287,25 @@ def knn_val_mae(q_y, q_fin, q_logs, b_y, b_fin, b_logs, k: int = 16,
                 t: float = 0.1, device="cpu") -> float:
     """Cross-log top-k cosine kNN of ego-slot y_hat -> weighted final MAE.
 
-    weights = softmax(cos / t) over the k neighbours (t=0.1).
+    weights = softmax(cos / t) over the k neighbours (t=0.1). Logs are mapped
+    to integer ids once and the same-log exclusion is a vectorised mask, so
+    the (chunk, bank) sim matrix stays small and there is no per-row python.
     """
     qn = q_y / (np.linalg.norm(q_y, axis=1, keepdims=True) + 1e-8)
     bn = b_y / (np.linalg.norm(b_y, axis=1, keepdims=True) + 1e-8)
     bt = torch.from_numpy(bn).to(device)
     bf = torch.from_numpy(b_fin).float().to(device)
+    uniq = np.unique(np.concatenate([np.asarray(q_logs), np.asarray(b_logs)]))
+    lid = {v: i for i, v in enumerate(uniq)}
+    ql = torch.from_numpy(np.array([lid[v] for v in q_logs])).to(device)
+    bl = torch.from_numpy(np.array([lid[v] for v in b_logs])).to(device)
     maes = []
-    CH = 8192
+    CH = 1024
     for s in range(0, len(qn), CH):
         qc = torch.from_numpy(qn[s:s + CH]).to(device)
         sim = qc @ bt.T                                     # (c, NB)
-        for i, ln in enumerate(q_logs[s:s + CH]):
-            same = torch.from_numpy(b_logs == ln).to(device)
-            sim[i] = sim[i].masked_fill(same, -1e9)
+        same = ql[s:s + CH, None] == bl[None, :]
+        sim = sim.masked_fill(same, -1e9)
         tk = sim.topk(k, dim=-1)                            # (c, k)
         w = torch.softmax(tk.values / t, dim=-1)
         fhat = (w * bf[tk.indices]).sum(-1).cpu().numpy()
@@ -386,6 +391,18 @@ def main() -> None:
                             num_workers=args.num_workers, collate_fn=collate,
                             pin_memory=True)
 
+    mem_loader = None
+    if args.select_metric == "knn_val" and args.model == "b3":
+        mem_rng = np.random.default_rng(0)
+        mem_tokens = mem_rng.choice(
+            train_tokens, size=min(4000, len(train_tokens)), replace=False)
+        mem_ds = LatentDataset(list(mem_tokens), lat_index, labels_dir,
+                               structured, None)
+        mem_loader = DataLoader(mem_ds, batch_size=args.batch_size,
+                                shuffle=False, num_workers=args.num_workers,
+                                collate_fn=collate, pin_memory=True)
+        print(f"[train] knn_val memory subset: {len(mem_ds)} scenes", flush=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(args.model, args.n_layers, use_future=fmap is not None,
                         dropout=args.dropout, no_pfeat=args.no_pfeat,
@@ -469,7 +486,7 @@ def main() -> None:
         row = {"epoch": epoch, "secs": round(time.time() - t0, 1),
                **{k: round(v / nb, 4) for k, v in losses.items()}, **metrics}
         if args.select_metric == "knn_val" and args.model == "b3":
-            ty, tf, tl = collect_yego(model, train_loader, device)
+            ty, tf, tl = collect_yego(model, mem_loader, device)
             vy, vf, vl = collect_yego(model, val_loader, device)
             mae = knn_val_mae(vy, vf, vl, ty, tf, tl, device=device)
             row["knn_val"] = round(mae, 5)

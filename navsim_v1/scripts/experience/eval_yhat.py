@@ -67,13 +67,13 @@ def collect_query(model, loader, device):
 
 @torch.no_grad()
 def collect_bank(model, loader, device, bank=None):
-    """-> y (N,L), finals (N,), cand-level logs (N,) over all loader candidates.
+    """-> y (N,L), finals (N,), cand-level logs (N,), scene tokens (N,).
 
     With ``bank`` (token->(trajs,subs)), each scene's bank trajectories are
     forwarded as extra candidates (model must be no_pfeat) and appended with
     their true subscore finals.
     """
-    ys, fin, lg = [], [], []
+    ys, fin, lg, sc = [], [], [], []
     for b in loader:
         img = b["image_feature"].to(device)
         out = model(img, b["proposal_feature"].to(device),
@@ -82,6 +82,7 @@ def collect_bank(model, loader, device, bank=None):
         fin.append(b["labels"][..., 5].numpy())
         for i, ln in enumerate(b["log_names"]):
             lg.extend([ln] * b["labels"].shape[1])
+            sc.extend([b["tokens"][i]] * b["labels"].shape[1])
         if bank is not None:
             bt_list, bs_list, have = [], [], []
             for i, t in enumerate(b["tokens"]):
@@ -92,18 +93,20 @@ def collect_bank(model, loader, device, bank=None):
                     bs_list.append(e[1])
             if have:
                 im = img[have]
-                bt = torch.from_numpy(np.concatenate(bt_list)).float().to(device)
-                B, NB = im.shape[0], bt.shape[0] // im.shape[0]
-                # scenes may have different NB -> pad to max, mask none (bank
-                # sizes are uniform-ish; fall back to per-scene loop if ragged)
+                # scenes may have different NB -> fall back to per-scene loop
+                # if ragged
                 lens = [len(x) for x in bt_list]
                 if len(set(lens)) == 1:
-                    out2 = model(im, torch.zeros(B, lens[0], 256, device=device), bt.view(B, lens[0], 8, 3))
+                    B = im.shape[0]
+                    bt = torch.from_numpy(np.concatenate(bt_list)).float().to(device)
+                    out2 = model(im, torch.zeros(B, lens[0], 256, device=device),
+                                 bt.view(B, lens[0], 8, 3))
                     yb = out2["y_hat"][:, :, 0].float().cpu().numpy()
                     for i, s in enumerate(have):
                         ys.append(yb[i])
                         fin.append(np.asarray(bs_list[i])[:, 5])
-                        lg.extend([b["log_names"][s]] * lens[0])
+                        lg.extend([b["log_names"][s]] * lens[i])
+                        sc.extend([b["tokens"][s]] * lens[i])
                 else:
                     for i, s in enumerate(have):
                         tr = torch.from_numpy(bt_list[i]).float().to(device)
@@ -112,9 +115,11 @@ def collect_bank(model, loader, device, bank=None):
                                      tr.unsqueeze(0))
                         ys.append(out2["y_hat"][0, :, 0].float().cpu().numpy())
                         fin.append(np.asarray(bs_list[i])[:, 5])
-                        lg.extend([b["log_names"][s]] * lens[0])
-    return (np.concatenate(ys).reshape(-1, ys[0].shape[-1]),
-            np.concatenate(fin).reshape(-1), np.asarray(lg))
+                        lg.extend([b["log_names"][s]] * lens[i])
+                        sc.extend([b["tokens"][s]] * lens[i])
+    return (np.concatenate([a.reshape(-1, a.shape[-1]) for a in ys]),
+            np.concatenate([np.asarray(f).reshape(-1) for f in fin]),
+            np.asarray(lg), np.asarray(sc))
 
 
 def action_sensitivity(y_ego, labels):
@@ -162,21 +167,23 @@ def topk_indices(pdm_row, k):
     return np.argpartition(-pdm_row, k - 1)[:k]
 
 
-def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu",
-             bank_scene_of=None):
+def knn_fhat(q_y, q_logs, b_y, b_fin, b_logs, k=16, t=0.1, device="cpu"):
     """Per-query cross-log top-k cosine kNN -> weighted f_hat (N,)."""
     qn = q_y / (np.linalg.norm(q_y, axis=1, keepdims=True) + 1e-8)
     bn = b_y / (np.linalg.norm(b_y, axis=1, keepdims=True) + 1e-8)
     bt = torch.from_numpy(bn).to(device)
     bf = torch.from_numpy(b_fin).float().to(device)
+    uniq = np.unique(np.concatenate([np.asarray(q_logs), np.asarray(b_logs)]))
+    lid = {v: i for i, v in enumerate(uniq)}
+    ql = torch.from_numpy(np.array([lid[v] for v in q_logs])).to(device)
+    bl = torch.from_numpy(np.array([lid[v] for v in b_logs])).to(device)
     out = np.zeros(len(qn), np.float32)
-    CH = 8192
+    CH = 1024
     for s in range(0, len(qn), CH):
         qc = torch.from_numpy(qn[s:s + CH]).to(device)
         sim = qc @ bt.T
-        for i, ln in enumerate(q_logs[s:s + CH]):
-            same = torch.from_numpy(b_logs == ln).to(device)
-            sim[i] = sim[i].masked_fill(same, -1e9)
+        same = ql[s:s + CH, None] == bl[None, :]
+        sim = sim.masked_fill(same, -1e9)
         tk = sim.topk(min(k, sim.shape[1]), dim=-1)
         w = torch.softmax(tk.values / t, dim=-1)
         out[s:s + CH] = (w * bf[tk.indices]).sum(-1).cpu().numpy()
@@ -198,17 +205,20 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
     q_fin = labels[..., 5].reshape(-1)
     q_cand_logs = np.repeat(q_logs, K)
 
-    b0_wrong = np.zeros(S, bool)
-    for s in range(S):
-        tk = topk_indices(pdm[s], 8)
-        b0_wrong[s] = pdm[s].argmax() != tk[labels[s, tk, 5].argmax()]
-
-    scene_mask = {"all": np.ones(S, bool), "b0_wrong": b0_wrong, "rare10": rare10}
+    # b0_wrong per K: B0's top1 final is strictly below the top-K best final
+    b0_wrong = {}
+    for Ksel in (4, 8):
+        m = np.zeros(S, bool)
+        for s in range(S):
+            tk = topk_indices(pdm[s], Ksel)
+            m[s] = labels[s, pdm[s].argmax(), 5] < \
+                labels[s, tk, 5].max() - 1e-6
+        b0_wrong[Ksel] = m
 
     for bname, (b_y, b_fin, b_logs, b_scene) in bank_variants.items():
         fhat_flat = knn_fhat(q_y, q_cand_logs, b_y, b_fin, b_logs, device=device)
         fhat = fhat_flat.reshape(S, K)
-        # shuffle control: permute finals within each bank scene
+        # shuffle control: permute finals within each bank SCENE (token)
         rng = np.random.default_rng(0)
         b_fin_sh = b_fin.copy()
         for sc in np.unique(b_scene):
@@ -222,6 +232,8 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
 
         m2, m3 = {}, {}
         for Ksel in (4, 8):
+            scene_mask = {"all": np.ones(S, bool),
+                          "b0_wrong": b0_wrong[Ksel], "rare10": rare10}
             for sub, msk in scene_mask.items():
                 auc_f, auc_b, ps = [], [], []
                 npairs = 0
@@ -312,14 +324,13 @@ def main():
 
         # bank memory: train split B0 proposals
         print(f"[{tag}] collecting train bank ...", flush=True)
-        b_y, b_fin, b_logs = collect_bank(model, ref_loader, device)
-        b_scene = np.unique(b_logs, return_inverse=True)[1]
+        b_y, b_fin, b_logs, b_scene = collect_bank(model, ref_loader, device)
         variants = {"b0prop": (b_y, b_fin, b_logs, b_scene)}
         if bank is not None and getattr(model.action, "no_pfeat", False):
             print(f"[{tag}] collecting train bank + clover trajs ...", flush=True)
             # second pass reusing same loader for bank trajectories
-            by2, bf2, bl2 = collect_bank(model, ref_loader, device, bank=bank)
-            bs2 = np.unique(bl2, return_inverse=True)[1]
+            by2, bf2, bl2, bs2 = collect_bank(model, ref_loader, device,
+                                             bank=bank)
             variants["b0prop+bank"] = (by2, bf2, bl2, bs2)
 
         report[tag] = run_metrics(tag, y_ego, labels, pdm, q_logs, variants,

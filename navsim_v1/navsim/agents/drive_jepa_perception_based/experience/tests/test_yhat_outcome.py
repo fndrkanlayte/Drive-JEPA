@@ -160,3 +160,43 @@ def test_build_model_no_pfeat():
     img = torch.randn(1, 512, D)
     out = m(img, torch.randn(1, 10, D), torch.randn(1, 10, 8, 3))
     assert out["y_hat"].shape == (1, 10, 5, L)
+
+
+def test_collect_bank_ragged_log_alignment():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5] / "scripts" / "experience"))
+    from torch.utils.data import DataLoader
+    from train_ewm import build_model, collate
+    from eval_yhat import collect_bank
+
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    K = 4
+
+    def item(tok, ln):
+        return dict(token=tok, log_name=ln,
+                    image_feature=rng.normal(size=(512, D)).astype(np.float32),
+                    proposal_feature=rng.normal(size=(K, D)).astype(np.float32),
+                    proposals=rng.normal(size=(K, 8, 3)).astype(np.float32),
+                    pdm_score=rng.random(K).astype(np.float32),
+                    outcomes=rng.normal(size=(K, 18)).astype(np.float32),
+                    labels=rng.random((K, 6)).astype(np.float32))
+
+    ds = [item("tA", "logA"), item("tB", "logB")]
+    loader = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=collate)
+    bank = {"tA": (rng.normal(size=(3, 8, 3)).astype(np.float32),
+                   rng.random((3, 6)).astype(np.float32)),
+            "tB": (rng.normal(size=(5, 8, 3)).astype(np.float32),
+                   rng.random((5, 6)).astype(np.float32))}
+    model = build_model("b3", 1, use_future=False, no_pfeat=True).eval()
+    y, fin, lg, sc = collect_bank(model, loader, torch.device("cpu"), bank=bank)
+
+    assert len(lg) == len(y) == 2 * K + 3 + 5
+    assert list(lg[:K]) == ["logA"] * K
+    assert list(lg[K:2 * K]) == ["logB"] * K
+    # ragged bank rows must stay aligned to their own scene's log/token
+    assert list(lg[2 * K:2 * K + 3]) == ["logA"] * 3
+    assert list(lg[2 * K + 3:]) == ["logB"] * 5
+    assert list(sc[2 * K:2 * K + 3]) == ["tA"] * 3
+    assert list(sc[2 * K + 3:]) == ["tB"] * 5
+    assert np.allclose(fin[2 * K:2 * K + 3], bank["tA"][1][:, 5])
+    assert np.allclose(fin[2 * K + 3:], bank["tB"][1][:, 5])
