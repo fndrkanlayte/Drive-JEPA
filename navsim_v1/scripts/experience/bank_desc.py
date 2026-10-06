@@ -149,7 +149,8 @@ if __name__ == "__main__":
     p.add_argument("--metric_cache_dir", required=True)
     p.add_argument("--out", default=None)
     p.add_argument("--top_m", type=int, default=4)
-    p.add_argument("--prefilter_dist", type=float, default=30.0)
+    p.add_argument("--prefilter_dist", type=float, default=50.0,
+                   help="must match label_candidates default (50.0)")
     p.add_argument("--workers", type=int, default=96)
     p.add_argument("--check", type=int, default=0,
                    help="run N-scene B0-descriptor consistency check")
