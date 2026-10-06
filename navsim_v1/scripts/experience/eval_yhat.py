@@ -200,7 +200,7 @@ def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu",
     bl = torch.from_numpy(np.array([lid[v] for v in b_logs])).to(device)
     n = len(qn)
     out = {k_: np.zeros(n, np.float32) for k_ in
-           ("fhat", "p_nc", "p_dac", "p_ttc", "f_ep", "cos")}
+           ("fhat", "p_nc", "p_dac", "p_ttc", "p_any", "f_ep", "cos")}
     CH = 1024
     for s in range(0, n, CH):
         qc = torch.from_numpy(qn[s:s + CH]).to(device)
@@ -215,6 +215,8 @@ def knn_readout(q_y, q_logs, b_y, b_subs, b_logs, k=16, t=0.1, device="cpu",
         out["p_nc"][sl] = (w * (nb[..., 0] < 1).float()).sum(-1).cpu().numpy()
         out["p_dac"][sl] = (w * (nb[..., 1] < 1).float()).sum(-1).cpu().numpy()
         out["p_ttc"][sl] = (w * (nb[..., 3] < 1).float()).sum(-1).cpu().numpy()
+        out["p_any"][sl] = (w * ((nb[..., 0] < 1) | (nb[..., 1] < 1)
+                                 | (nb[..., 3] < 1)).float()).sum(-1).cpu().numpy()
         out["f_ep"][sl] = (w * nb[..., 2]).sum(-1).cpu().numpy()
         out["cos"][sl] = tk.values.clamp(-1, 1).mean(-1).cpu().numpy()
     return out
@@ -276,7 +278,7 @@ def run_metrics(tag, y_ego, labels, pdm, q_logs, bank_variants, tert, rare10,
         if dumps is not None:
             d = {"fhat": fhat.astype(np.float32),
                  "fhat_shuf": fhat_sh.astype(np.float32)}
-            for k_ in ("p_nc", "p_dac", "p_ttc", "f_ep", "cos"):
+            for k_ in ("p_nc", "p_dac", "p_ttc", "p_any", "f_ep", "cos"):
                 d[k_] = rd[k_].reshape(S, K).astype(np.float32)
                 d[k_ + "_shuf"] = rd_sh[k_].reshape(S, K).astype(np.float32)
             dumps[bname] = d

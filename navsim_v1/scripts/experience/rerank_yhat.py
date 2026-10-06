@@ -118,6 +118,27 @@ def grid(npz, variant, diagnose_rows=None, selected_only=None):
     res = {"_cos_stats": {"median": float(np.median(cos)),
                           "p10": float(np.quantile(cos, .10)),
                           "p90": float(np.quantile(cos, .90))}}
+    # danger recall: can the kNN readout recognise truly-unsafe candidates?
+    if "subs" in npz.files and pre + "p_any" in npz.files:
+        subs, pun = npz["subs"], npz[pre + "p_any"]
+        pu_d, pu_s = [], []
+        auc_cnt = auc_den = 0.0
+        for s in range(len(pdm)):
+            tk = topk_idx(pdm[s], 8)
+            danger = (subs[s, tk, 0] < 1) | (subs[s, tk, 1] < 1) \
+                | (subs[s, tk, 3] < 1)
+            for j, dgr in zip(tk, danger):
+                (pu_d if dgr else pu_s).append(pun[s, j])
+            for j in tk[danger]:
+                for j2 in tk[~danger]:
+                    auc_den += 1
+                    auc_cnt += (pun[s, j] > pun[s, j2]) \
+                        + .5 * (pun[s, j] == pun[s, j2])
+        res["_danger_recall"] = {
+            "p_unsafe_dangerous": float(np.mean(pu_d)) if pu_d else None,
+            "p_unsafe_safe": float(np.mean(pu_s)) if pu_s else None,
+            "auc": float(auc_cnt / auc_den) if auc_den else None,
+            "n_dangerous": len(pu_d)}
     for k in KS:
         if f"b0_wrong_K{k}" in npz.files:
             b0w = npz[f"b0_wrong_K{k}"].astype(bool)
